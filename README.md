@@ -14,8 +14,9 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 - ✅ Wii U ↔ Jellyfin connection
 - ✅ Authentication
 - ✅ Library browsing
+- ✅ Music playback
+- ❌ Full music player controls (Pause, shuffle, play queue and seek are yet to be added)
 - ❌ UI
-- ❌ Music playback
 - ❌ Video playback
 
 ## Goals
