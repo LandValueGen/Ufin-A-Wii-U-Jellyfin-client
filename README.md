@@ -3,6 +3,8 @@ WIP jellyfin client for the Nintendo Wii U
 
 -------------------------------------------
 
+> ⚠️ Video playback is currently not functional. Music playback is the only working media playback feature at the moment.
+
 # Jellyfin Wii U
 
 A native Jellyfin client for the Nintendo Wii U because why not XD.
@@ -14,9 +16,10 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 - ✅ Wii U ↔ Jellyfin connection
 - ✅ Authentication
 - ✅ Library browsing
+- ✅ Playback report to Jellyfin
 - ✅ Music playback
 - ❌ Full music player controls (Pause, shuffle, play queue and seek are yet to be added)
-- ❌ UI
+- ❌ Wii U style UI
 - ❌ Video playback
 
 ## Goals
@@ -30,6 +33,27 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 - 720p30 H.264/AAC software playback
 - 1080p60 hardware playback if possible
 - Eventually, direct play where possible
+
+## Installation
+
+1. Download the ZIP file from the "Releases" page.
+
+2. Extract the contents of the ZIP to the root of your Wii U's SD card.
+
+3. Open "config.json" and enter your Jellyfin server details and credentials.
+
+4. Insert the SD card into your Wii U and launch Ufin through your preferred homebrew method.
+
+## SD Card Layout:
+
+```text
+SD:/
+├── wiiu/
+│   └── apps/
+│       └── ufin/
+│           ├── ufin.wuhb
+│           └── config.json
+```     
 
 ## Development
 
