@@ -112,3 +112,82 @@ bool JellyfinClient::getItems(const std::string& parentId, std::vector<JellyfinI
     cJSON_Delete(json);
     return true;
 }
+
+StreamTarget JellyfinClient::buildAudioStreamUrl(const std::string& itemId) const {
+    StreamTarget target;
+    target.host = host_;
+    target.port = port_;
+
+    // .mp4 container, not .mp3 -- our FFmpeg build (see configure-wiiu)
+    // only has the mov demuxer enabled, no MP3/ADTS demuxer, so an
+    // actual .mp3-formatted stream would be undecodable by us even
+    // though the URL would "work" against Jellyfin. AAC-in-MP4 is
+    // exactly what the video path already uses successfully for audio
+    // tracks, just without a video stream here.
+    char pathBuf[900];
+    snprintf(pathBuf, sizeof(pathBuf),
+        "/Audio/%s/stream.mp4?static=false&AudioCodec=aac&AudioBitrate=192000"
+        "&api_key=%s",
+        itemId.c_str(), token_.c_str());
+    target.path = pathBuf;
+    return target;
+}
+
+StreamTarget JellyfinClient::buildVideoStreamUrl(const std::string& itemId) const {
+    StreamTarget target;
+    target.host = host_;
+    target.port = port_;
+
+    char pathBuf[900];
+    snprintf(pathBuf, sizeof(pathBuf),
+        "/Videos/%s/stream.mp4?static=false&VideoCodec=h264&AudioCodec=aac"
+        "&MaxWidth=1280&MaxHeight=720&VideoBitrate=2500000&AudioBitrate=192000"
+        // Without these, Jellyfin appears to "copy" the video stream
+        // unchanged when the source is already H.264 -- ignoring our
+        // resolution/bitrate caps above and sending the original
+        // (possibly much higher resolution/profile) stream instead,
+        // which the Wii U's hardware decoder can't handle. Forcing this
+        // off makes Jellyfin actually re-encode every time, regardless
+        // of whether the source codec already matches what we asked for.
+        "&AllowVideoStreamCopy=false&AllowAudioStreamCopy=false"
+        "&api_key=%s",
+        itemId.c_str(), token_.c_str());
+    target.path = pathBuf;
+    return target;
+}
+
+static bool postSessionEvent(const std::string& host, int port, const std::string& authHeader,
+                              const std::string& endpoint, const std::string& itemId,
+                              int64_t positionTicks, bool includePosition) {
+    cJSON* body = cJSON_CreateObject();
+    cJSON_AddStringToObject(body, "ItemId", itemId.c_str());
+    cJSON_AddBoolToObject(body, "CanSeek", false);
+    cJSON_AddStringToObject(body, "PlayMethod", "Transcode");
+    if (includePosition) {
+        // cJSON's number type is a double -- fine here, ticks values in
+        // our use (elapsed playback seconds * 10,000,000) stay well
+        // within double's exact-integer range for any realistic
+        // playback duration.
+        cJSON_AddNumberToObject(body, "PositionTicks", (double)positionTicks);
+    }
+    char* bodyStr = cJSON_PrintUnformatted(body);
+
+    HttpResponse resp = http_post(host, port, endpoint, bodyStr, "application/json", authHeader);
+    free(bodyStr);
+    cJSON_Delete(body);
+    return resp.success;
+}
+
+bool JellyfinClient::reportPlaybackStart(const std::string& itemId) {
+    return postSessionEvent(host_, port_, authHeader(), "/Sessions/Playing", itemId, 0, false);
+}
+
+bool JellyfinClient::reportPlaybackProgress(const std::string& itemId, int64_t positionTicks) {
+    return postSessionEvent(host_, port_, authHeader(), "/Sessions/Playing/Progress", itemId,
+                             positionTicks, true);
+}
+
+bool JellyfinClient::reportPlaybackStopped(const std::string& itemId, int64_t positionTicks) {
+    return postSessionEvent(host_, port_, authHeader(), "/Sessions/Playing/Stopped", itemId,
+                             positionTicks, true);
+}

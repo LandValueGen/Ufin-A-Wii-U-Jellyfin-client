@@ -8,18 +8,78 @@ set(CMAKE_TOOLCHAIN_FILE "$ENV{DEVKITPRO}/wut/share/wut.toolchain.cmake")
 
 project(ufin CXX C)
 
+# FFmpeg (built from FFmpeg-wiiu, see configure-wiiu) installs here --
+# confirmed by actually running the build, not a guess.
+include_directories("$ENV{DEVKITPRO}/portlibs/ppc/include")
+link_directories("$ENV{DEVKITPRO}/portlibs/ppc/lib")
+
+# SDL2 (wiiu-sdl2, installed via dkp-pacman) -- devkitPro's convention for
+# Wii U-specific portlibs is a separate "wiiu" folder, distinct from the
+# generic "ppc" one FFmpeg's own configure script chose. UNVERIFIED: if
+# the build fails to find SDL2 headers/libs, run
+#   find /opt/devkitpro/portlibs -maxdepth 3 -iname '*SDL2*'
+# and fix these two paths to match reality.
+include_directories("$ENV{DEVKITPRO}/portlibs/wiiu/include")
+link_directories("$ENV{DEVKITPRO}/portlibs/wiiu/lib")
+
 add_executable(ufin
     src/main.cpp
     src/http_client.cpp
+    src/http_stream_reader.cpp
     src/jellyfin_client.cpp
     src/vendor/cJSON.c
+    src/media/http_stream_io.cpp
+    src/media/decoder.cpp
+    src/media/video_output.cpp
+    src/media/audio_output.cpp
+    src/media/player.cpp
 )
 
 target_include_directories(ufin PRIVATE src src/vendor)
 
+# Compile our GLSL shaders (src/media/shaders/rgb_video.{vert,frag}) into
+# a .gsh binary via glslcompiler.elf (from Exzap/CafeGLSL -- a Mesa-based
+# GLSL-to-Latte/GX2 shader compiler, MIT-licensed for its own additions),
+# then embed that binary into a C header via tools/bin2h.py so it ships
+# inside the executable rather than needing to be loaded from the SD
+# card at runtime.
+#
+# glslcompiler.elf itself is NOT part of this repo -- download it from
+# https://github.com/Exzap/CafeGLSL/releases and place it at
+# tools/glslcompiler.elf before building.
+set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/media/shaders)
+set(GLSLCOMPILER ${CMAKE_CURRENT_SOURCE_DIR}/tools/glslcompiler.elf)
+set(BIN2H ${CMAKE_CURRENT_SOURCE_DIR}/tools/bin2h.py)
+
+add_custom_command(
+    OUTPUT ${SHADER_DIR}/rgb_video_shader.h
+    COMMAND ${GLSLCOMPILER} -vs ${SHADER_DIR}/rgb_video.vert -ps ${SHADER_DIR}/rgb_video.frag
+            -o ${SHADER_DIR}/rgb_video.gsh
+    COMMAND python3 ${BIN2H} ${SHADER_DIR}/rgb_video.gsh ${SHADER_DIR}/rgb_video_shader.h rgb_video_shader
+    DEPENDS ${SHADER_DIR}/rgb_video.vert ${SHADER_DIR}/rgb_video.frag ${GLSLCOMPILER} ${BIN2H}
+    COMMENT "Compiling rgb_video shader (glslcompiler.elf + bin2h.py)"
+)
+add_custom_target(ufin_shaders DEPENDS ${SHADER_DIR}/rgb_video_shader.h)
+add_dependencies(ufin ufin_shaders)
+
 # whb = "Wii U Homebrew Bootstrap" helper lib bundled with wut, gives us
-# WHBProcInit/WHBLogConsole/etc without hand-rolling the app lifecycle.
-target_link_libraries(ufin wut)
+# WHBProcInit/OSScreen-adjacent helpers without hand-rolling the app
+# lifecycle. In current wut releases it's merged into libwut.a rather
+# than shipping as a separate libwhb.a.
+#
+# FFmpeg libs: order matters for static linking -- avformat depends on
+# avcodec, both depend on avutil, swresample/swscale depend on avutil.
+# Listing avutil last lets the linker resolve symbols pulled in by the
+# others above it.
+target_link_libraries(ufin
+    wut
+    SDL2
+    avformat
+    avcodec
+    swresample
+    swscale
+    avutil
+)
 
 wut_create_rpx(ufin)
 
@@ -32,6 +92,7 @@ if(WUHBTOOL)
             --name="Ufin"
             --short-name="Ufin"
             --author="antu2010"
+            --icon="${CMAKE_CURRENT_SOURCE_DIR}/icon.png"
         COMMENT "Packing ufin.wuhb"
     )
 else()
