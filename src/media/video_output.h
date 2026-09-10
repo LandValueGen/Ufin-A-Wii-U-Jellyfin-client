@@ -1,106 +1,112 @@
-// VideoOutput -- takes decoded video AVFrames and puts them on screen.
+// VideoOutput -- takes decoded NV12 video AVFrames and puts them on both
+// the TV and the GamePad screen via raw GX2, using WHBGfx (the helper
+// library bundled with wut) for display/context setup.
 //
-// This is a from-scratch raw-GX2 renderer, replacing an earlier SDL2-
-// based implementation. SDL2's SDL_Renderer/SDL_Texture path was
-// confirmed working end-to-end (every call succeeded, correct frame
-// data uploaded) but never actually produced visible output on Wii U --
-// strong evidence SDL2's high-level texture rendering has a real gap on
-// this particular platform port. CafeMP (an existing, working Wii U
-// media player) sidesteps this the same way: use SDL2 only for
-// window/input/audio, and do actual GPU drawing via raw GX2 + a custom
-// shader. This class follows that same architecture, using WHBGfx (a
-// companion helper library within wut, same family as WHBProcInit) for
-// GX2 context setup instead of SDL2's renderer.
+// Design, deliberately mirroring CafeMP's working Wii U renderer:
 //
-// NOTE: this is a first draft against an API surface (raw GX2/WHBGfx)
-// we have not compile-tested at all -- treat function names, struct
-// fields, and call ordering below as a best-effort first attempt, not a
-// verified-correct reference. Expect a real debugging round.
+//  * Two textures per frame, not one: an R8 texture for the luma (Y)
+//    plane at full resolution and an RG8 texture for the interleaved
+//    chroma (UV) plane at half resolution -- exactly the memory layout
+//    NV12 already has, so uploading a frame is two straight memcpys of
+//    the decoder's planes. The pixel shader (shaders/nv12_video.frag)
+//    does the YUV->RGB conversion on the GPU. The earlier design here
+//    converted to RGBA on the CPU with libswscale first; on the Wii U's
+//    CPU that alone costs more than a 30 fps frame budget at 720p, so
+//    even had it displayed it could never have kept up.
 //
-// Pixel format: decoded frames are NV12 (h264_wiiu's native output).
-// This class converts them to RGBA32 on the CPU via libswscale (the
-// same conversion approach already proven working with the old SDL2
-// texture path -- RGBA rather than RGB24 this time because GX2/GPU
-// texture formats are 4-byte-aligned; there's no real hardware format
-// for tightly-packed 24-bit RGB). The GPU-side shader (see
-// src/media/shaders/rgb_video.frag) is then a plain passthrough with no
-// YUV math at all -- conversion happens entirely before the GPU is
-// involved.
+//  * Each plane is double-buffered (write into one texture while the
+//    GPU may still be sampling the other), matching CafeMP's
+//    VideoPlane::tex[2].
+//
+//  * The video is drawn aspect-fitted (letterboxed / pillarboxed) into
+//    whatever resolution WHBGfx actually gave us for each target, rather
+//    than assuming 1280x720 -- the TV colour buffer is 1920x1080 on a
+//    1080p TV and 854x480 or 640x480 on a 480p one, and the GamePad is
+//    always 854x480.
+//
+// SDL2 is deliberately not involved in drawing at all (only audio uses
+// it): SDL2's texture rendering path was confirmed to produce no output
+// on this platform despite every call succeeding.
 
 #pragma once
 extern "C" {
 #include <libavcodec/avcodec.h>
-#include <libswscale/swscale.h>
 }
 
 #include <whb/gfx.h>
-#include <gx2/mem.h>
+#include <gx2/enum.h>
 #include <gx2/texture.h>
 #include <gx2/sampler.h>
-#include <gx2/shaders.h>
-#include <gx2/draw.h>
-#include <gx2/event.h>
-#include <gx2/registers.h>
 #include <gx2/surface.h>
-#include <gx2r/buffer.h>
-#include <gx2r/draw.h>
-#include <gx2r/surface.h>
 
-#include <vector>
+#include <cstdint>
 
 class VideoOutput {
 public:
     VideoOutput();
     ~VideoOutput();
 
-    // width/height should match Decoder::videoWidth()/videoHeight().
-    bool init(int width, int height);
+    // width/height must match the decoded frames (Decoder::videoWidth()/
+    // videoHeight()). displayAspect is the aspect ratio the picture
+    // should be *shown* at -- normally width/height, but Jellyfin is
+    // asked to encode everything at exactly 1280x720 (see
+    // JellyfinClient::buildVideoStreamUrl for why), so a 2.39:1 movie
+    // arrives squeezed into 16:9 and this is how it gets un-squeezed.
+    // Pass <= 0 to use width/height.
+    bool init(int width, int height, double displayAspect);
 
-    // Converts the frame from NV12 to RGBA32 (via swscale), uploads it
-    // to the GPU texture, and draws + presents a fullscreen quad.
-    // Assumes frame->format == AV_PIX_FMT_NV12.
-    // Fills the texture with a solid color and draws+presents it via the
-    // exact same pipeline as renderFrame(), but with no decode, no
-    // swscale, no video data involved at all -- isolates whether the
-    // fundamental GX2 shader/draw/present machinery works, decoupled
-    // from everything video-specific. Diagnostic only.
-    void renderTestPattern();
-
+    // Uploads one NV12 frame to the GPU and draws + presents it on both
+    // screens. Frames of any other pixel format are ignored (logged once).
     void renderFrame(AVFrame* frame);
+
+    // Diagnostic: fills the planes with a flat colour and draws +
+    // presents through the exact same shader/draw/present path as
+    // renderFrame(), with no decoder involved. Lets the GX2 pipeline be
+    // checked on its own (hold ZR in the menu -- see main.cpp).
+    void renderTestPattern();
 
     void shutdown();
 
     const char* lastError() const { return last_error_; }
 
 private:
+    struct Plane {
+        GX2Texture tex[2]{};
+        GX2Sampler sampler{};
+        uint32_t bytesPerTexel = 1;
+        bool valid = false;
+    };
+
     int width_ = 0;
     int height_ = 0;
     char last_error_[256] = {0};
 
     bool gfx_initialized_ = false;
-
-    SwsContext* sws_ctx_ = nullptr;
-    std::vector<uint8_t> rgba_buffer_;
-    int rgba_linesize_ = 0;
-
-    // Double-buffered: write the new frame into one texture while
-    // drawing from the other (the previous, already-fully-written
-    // frame), then swap roles each frame. Confirmed via CafeMP's own
-    // working renderer (VideoPlane::tex[2], plane_write_idx ^= 1) that
-    // this is necessary -- a single texture locked/rewritten 30x/sec
-    // risks the GPU sampling it mid-write, which is consistent with
-    // everything we saw: correct data confirmed in GPU-visible memory,
-    // yet nothing displayed.
-    GX2Texture texture_[2]{};
-    int writeIndex_ = 0;
-    GX2RResourceFlags texture_flags_{};
-    GX2Sampler sampler_{};
-    void* quad_buffer_ = nullptr;
-    uint32_t quad_buffer_size_ = 0;
     WHBGfxShaderGroup shader_{};
+    uint32_t y_sampler_location_ = 0;
+    uint32_t uv_sampler_location_ = 1;
+
+    Plane y_plane_;   // R8, width_ x height_
+    Plane uv_plane_;  // RG8, width_/2 x height_/2
+    int write_index_ = 0;
+
+    // One aspect-fitted quad per target, since their resolutions (and
+    // on a 4:3 TV, aspect) differ. 4 vertices of {x, y, u, v}.
+    void* tv_quad_ = nullptr;
+    void* drc_quad_ = nullptr;
+    uint32_t tv_width_ = 0, tv_height_ = 0;
+    uint32_t drc_width_ = 0, drc_height_ = 0;
+
+    int unsupported_format_logged_ = 0;
 
     bool loadShader();
-    bool createTexture();
-    bool createQuad();
-    void drawFrame(int readIndex, int targetWidth, int targetHeight); // draws + samples texture_[readIndex] into a target of the given resolution
+    bool createPlane(Plane& plane, GX2SurfaceFormat format, uint32_t compMap,
+                     int width, int height, const char* name);
+    void destroyPlane(Plane& plane);
+    void fillPlane(Plane& plane, int index, uint8_t byte0, uint8_t byte1);
+    void uploadPlane(Plane& plane, int index, const uint8_t* src, int srcLinesize,
+                     int bytesPerRow, int rows);
+    void* buildQuad(uint32_t targetWidth, uint32_t targetHeight, double displayAspect);
+    void drawQuad(int readIndex, const void* quad, uint32_t targetWidth, uint32_t targetHeight);
+    void present(int readIndex);
 };

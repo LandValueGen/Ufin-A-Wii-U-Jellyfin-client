@@ -20,3 +20,4 @@ config.json
 .vscode/
 *.swp
 .DS_Store
+tests/host/build/

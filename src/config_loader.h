@@ -16,6 +16,12 @@ struct UfinConfig {
     int port = 0;
     std::string username;
     std::string password;
+
+    // Optional video transcode settings (see JellyfinClient::
+    // buildVideoStreamUrl for what they mean and why the defaults are
+    // what they are). Missing from config.json -> these defaults.
+    int videoBitrate = 2500000;
+    std::string videoProfile = "baseline";
 };
 
 // Tries to load and parse the config file. On success, fills outConfig
@@ -23,3 +29,7 @@ struct UfinConfig {
 // short human-readable reason (missing file, invalid JSON, missing
 // field) -- meant to be shown on screen, not just logged.
 bool loadConfigFromSD(UfinConfig& outConfig, std::string& outError);
+
+// Same, from an arbitrary path (what loadConfigFromSD calls with the SD
+// card location; also what the host tests use).
+bool loadConfigFromFile(const char* path, UfinConfig& outConfig, std::string& outError);

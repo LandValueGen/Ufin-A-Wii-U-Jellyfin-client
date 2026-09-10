@@ -3,6 +3,13 @@
 // FLTP) and converts + queues them for SDL2 to play. Decoder.cpp doesn't
 // know or care about this conversion; it's entirely AudioOutput's job,
 // keeping "decode" and "get audio out of the speakers" cleanly separate.
+//
+// It also acts as the playback clock for A/V sync: because SDL tells us
+// how much queued audio it hasn't played yet, we always know (to within
+// one device buffer) which stream timestamp is currently coming out of
+// the speakers. Player paces video against that -- audio is the master
+// clock, as in every practical media player, because the ear notices
+// audio glitches far more than the eye notices a dropped frame.
 
 #pragma once
 extern "C" {
@@ -10,6 +17,7 @@ extern "C" {
 #include <libswresample/swresample.h>
 }
 #include <SDL2/SDL.h>
+#include <mutex>
 
 class AudioOutput {
 public:
@@ -21,16 +29,33 @@ public:
     // Output is always resampled to interleaved 16-bit stereo, which is
     // what we ask SDL to open the audio device with -- simplest common
     // format, avoids needing to handle every possible source layout
-    // downstream.
+    // downstream. The device starts paused; call start() to begin
+    // playback (Player does this once the first video frame is up, so
+    // audio doesn't run ahead while video is still spinning up).
     bool init(int sourceSampleRate, int sourceChannels, AVSampleFormat sourceFormat);
 
     // Converts one decoded frame and queues the result for playback.
-    void queueFrame(AVFrame* frame);
+    // ptsSeconds is the frame's stream time (Decoder::frameTimeSeconds),
+    // or NAN if unknown; it drives clockSeconds(). Safe to call from a
+    // different thread than the one reading the clock.
+    void queueFrame(AVFrame* frame, double ptsSeconds);
 
-    // How much queued audio (in bytes, at the output format) SDL hasn't
-    // played yet. Used by Player for rough audio/video pacing -- if this
-    // gets too large we're decoding video faster than it needs to play.
+    void start();
+    bool started() const { return started_; }
+
+    // How much queued audio SDL hasn't played yet -- in bytes at the
+    // output format, or in seconds. Used by Player to keep the decode
+    // thread from running unboundedly ahead of playback.
     uint32_t queuedBytes() const;
+    double queuedSeconds() const;
+
+    // True once at least one timestamped frame has been queued, i.e.
+    // clockSeconds() means something.
+    bool hasClock() const;
+
+    // Estimated stream time (seconds) currently being played. Constant
+    // (the first queued frame's time) until start() is called.
+    double clockSeconds() const;
 
     void shutdown();
 
@@ -41,10 +66,21 @@ private:
     SwrContext* swr_ctx_ = nullptr;
     int out_channels_ = 2;
     int out_sample_rate_ = 48000;
+    int device_buffer_samples_ = 0; // per-channel samples per SDL callback (latency estimate)
+    bool started_ = false;
     char last_error_[256] = {0};
 
     // Scratch buffer reused across calls to avoid reallocating on every
     // single frame.
     uint8_t* convert_buffer_ = nullptr;
     int convert_buffer_capacity_samples_ = 0;
+
+    // Clock state: "stream time clock_pts_ was playing at wall time
+    // clock_wall_ms_"; extrapolated with wall time in between updates.
+    mutable std::mutex clock_mtx_;
+    bool clock_valid_ = false;
+    double clock_pts_ = 0.0;
+    uint32_t clock_wall_ms_ = 0;
+
+    double bytesPerSecond() const { return (double)out_sample_rate_ * out_channels_ * (int)sizeof(int16_t); }
 };

@@ -29,10 +29,16 @@ public:
     bool open(AVIOContext* avioCtx);
 
     // Decodes and returns the next available frame, whichever stream
-    // (video or audio) it comes from first -- video_frame_/audio_frame_
-    // is filled in accordingly. The returned AVFrame* stays owned by
-    // Decoder and is only valid until the next call to decodeNextFrame().
+    // (video or audio) it comes from first. The returned AVFrame* stays
+    // owned by Decoder and is only valid until the next call to
+    // decodeNextFrame() -- clone it (av_frame_clone) if it needs to
+    // outlive that.
     DecodedFrameType decodeNextFrame(AVFrame** outFrame);
+
+    // Presentation time of a frame just returned by decodeNextFrame(),
+    // in seconds of stream time (i.e. comparable between the audio and
+    // video streams). NAN if the container gave us no usable timestamp.
+    double frameTimeSeconds(DecodedFrameType type, const AVFrame* frame) const;
 
     void close();
 
@@ -42,6 +48,11 @@ public:
     int videoWidth() const { return video_ctx_ ? video_ctx_->width : 0; }
     int videoHeight() const { return video_ctx_ ? video_ctx_->height : 0; }
     AVRational videoTimeBase() const;
+    // Nominal seconds per frame from the container's frame rate, or 0 if
+    // unknown. Used as a fallback pacing interval when frames arrive
+    // without timestamps.
+    double videoFrameDuration() const;
+    const char* videoCodecName() const;
 
     // Audio stream info (only meaningful once open() succeeds and an
     // audio stream was found).
@@ -61,9 +72,12 @@ private:
     AVCodecContext* audio_ctx_ = nullptr;
 
     AVPacket* packet_ = nullptr;
+    bool packet_pending_ = false; // packet_ holds a read-but-not-yet-accepted packet
+    int send_retries_ = 0;
     AVFrame* frame_ = nullptr;
 
     bool reachedEof_ = false;
+    int video_decode_errors_ = 0;
     char last_error_[256] = {0};
 
     bool openCodecForStream(int streamIndex, AVCodecContext** outCtx);

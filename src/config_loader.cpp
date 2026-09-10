@@ -12,7 +12,11 @@
 static const char* CONFIG_PATH = "/vol/external01/wiiu/apps/ufin/config.json";
 
 bool loadConfigFromSD(UfinConfig& outConfig, std::string& outError) {
-    FILE* f = fopen(CONFIG_PATH, "rb");
+    return loadConfigFromFile(CONFIG_PATH, outConfig, outError);
+}
+
+bool loadConfigFromFile(const char* path, UfinConfig& outConfig, std::string& outError) {
+    FILE* f = fopen(path, "rb");
     if (!f) {
         outError = "config.json not found";
         return false;
@@ -55,6 +59,16 @@ bool loadConfigFromSD(UfinConfig& outConfig, std::string& outError) {
     outConfig.port = port->valueint;
     outConfig.username = username->valuestring;
     outConfig.password = password->valuestring;
+
+    // Optional video settings -- absent keys keep the struct defaults.
+    cJSON* videoBitrate = cJSON_GetObjectItem(json, "video_bitrate");
+    if (cJSON_IsNumber(videoBitrate) && videoBitrate->valueint > 0) {
+        outConfig.videoBitrate = videoBitrate->valueint;
+    }
+    cJSON* videoProfile = cJSON_GetObjectItem(json, "video_profile");
+    if (cJSON_IsString(videoProfile) && videoProfile->valuestring[0] != '\0') {
+        outConfig.videoProfile = videoProfile->valuestring;
+    }
 
     cJSON_Delete(json);
     return true;

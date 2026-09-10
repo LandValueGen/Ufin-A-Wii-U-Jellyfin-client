@@ -1,6 +1,7 @@
 #include "decoder.h"
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <coreinit/debug.h>
 
 Decoder::Decoder() {
@@ -15,14 +16,23 @@ Decoder::~Decoder() {
 }
 
 bool Decoder::openCodecForStream(int streamIndex, AVCodecContext** outCtx) {
-    AVCodecParameters* params = fmt_ctx_->streams[streamIndex]->codecpar;
+    AVStream* stream = fmt_ctx_->streams[streamIndex];
+    AVCodecParameters* params = stream->codecpar;
 
-    // avcodec_find_decoder() picks whatever decoder is registered for
-    // this codec ID. For H.264 that's h264_wiiu specifically -- our
-    // FFmpeg build (see configure-wiiu) never registered the generic
-    // software h264 decoder, only h264_wiiu, so there's no ambiguity
-    // here even though this call doesn't name it explicitly.
-    const AVCodec* codec = avcodec_find_decoder(params->codec_id);
+    // For H.264, ask for the Wii U hardware decoder (h264_wiiu, from the
+    // FFmpeg-wiiu fork) by name rather than trusting whatever
+    // avcodec_find_decoder() happens to return first -- if the FFmpeg
+    // build ever also has the generic software h264 decoder enabled, we
+    // still want the hardware one (this matches how CafeMP picks it).
+    // Falls back to the generic lookup for everything else (AAC, or an
+    // H.264 build without the hardware decoder).
+    const AVCodec* codec = nullptr;
+    if (params->codec_id == AV_CODEC_ID_H264) {
+        codec = avcodec_find_decoder_by_name("h264_wiiu");
+    }
+    if (!codec) {
+        codec = avcodec_find_decoder(params->codec_id);
+    }
     if (!codec) {
         snprintf(last_error_, sizeof(last_error_),
                  "no decoder registered for codec id %d", params->codec_id);
@@ -41,12 +51,20 @@ bool Decoder::openCodecForStream(int streamIndex, AVCodecContext** outCtx) {
         return false;
     }
 
+    // Lets the decoder stamp output frames with timestamps in the
+    // stream's own time base, which is what frameTimeSeconds() assumes.
+    ctx->pkt_timebase = stream->time_base;
+
     if (avcodec_open2(ctx, codec, nullptr) < 0) {
-        snprintf(last_error_, sizeof(last_error_), "avcodec_open2 failed for codec id %d",
-                 params->codec_id);
+        snprintf(last_error_, sizeof(last_error_), "avcodec_open2 failed for %s (codec id %d)",
+                 codec->name, params->codec_id);
         avcodec_free_context(&ctx);
         return false;
     }
+
+    OSReport("Ufin: opened decoder %s for stream %d (%dx%d, tb=%d/%d)\n", codec->name,
+             streamIndex, params->width, params->height, stream->time_base.num,
+             stream->time_base.den);
 
     *outCtx = ctx;
     return true;
@@ -62,6 +80,17 @@ bool Decoder::open(AVIOContext* avioCtx) {
     fmt_ctx_->pb = avioCtx;
     fmt_ctx_->flags |= AVFMT_FLAG_CUSTOM_IO;
 
+    // Bound how much of the live stream avformat_find_stream_info() is
+    // allowed to swallow before we start playing. FFmpeg's defaults
+    // (5 MB / 5 seconds) matter here because for H.264 it keeps reading
+    // -- and decoding, through the hardware decoder -- until it has seen
+    // enough frames to guess the reorder delay, and a 2.5 Mbit/s
+    // transcode only produces those bytes in real time. One second of
+    // content is plenty for the fragmented MP4 Jellyfin sends, and turns
+    // a multi-second black screen at start into a short one.
+    fmt_ctx_->probesize = 2 * 1024 * 1024;
+    fmt_ctx_->max_analyze_duration = AV_TIME_BASE;
+
     // The filename argument is only used by FFmpeg for format-guessing
     // hints when no custom IO is attached -- since pb is already set,
     // a non-null placeholder is enough; format detection here happens
@@ -72,7 +101,7 @@ bool Decoder::open(AVIOContext* avioCtx) {
         OSReport("Ufin: avformat_open_input failed (%d)\n", ret);
         return false;
     }
-    OSReport("Ufin: avformat_open_input ok\n");
+    OSReport("Ufin: avformat_open_input ok (format=%s)\n", fmt_ctx_->iformat->name);
 
     if (avformat_find_stream_info(fmt_ctx_, nullptr) < 0) {
         snprintf(last_error_, sizeof(last_error_), "avformat_find_stream_info failed");
@@ -119,7 +148,16 @@ DecodedFrameType Decoder::decodeNextFrame(AVFrame** outFrame) {
             }
             // AVERROR(EAGAIN) just means "no frame yet, feed me more
             // packets" -- not an error, fall through to read more.
-            // AVERROR_EOF means this stream is fully drained.
+            // AVERROR_EOF means this stream is fully drained. Anything
+            // else is a genuine decode error for one packet (h264_wiiu
+            // reports hardware decoder failures this way); the packet
+            // has already been consumed, so just log it and move on.
+            if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+                video_decode_errors_++;
+                if (video_decode_errors_ <= 5 || video_decode_errors_ % 100 == 0) {
+                    OSReport("Ufin: video decode error %d (count=%d)\n", ret, video_decode_errors_);
+                }
+            }
         }
         if (audio_ctx_) {
             int ret = avcodec_receive_frame(audio_ctx_, frame_);
@@ -136,29 +174,70 @@ DecodedFrameType Decoder::decodeNextFrame(AVFrame** outFrame) {
             return DecodedFrameType::NONE;
         }
 
-        int readRet = av_read_frame(fmt_ctx_, packet_);
-        if (readRet < 0) {
-            // End of stream (or a network error we can't distinguish
-            // from EOF here) -- flush both decoders so any frames
-            // they're internally holding onto get pushed out.
-            reachedEof_ = true;
-            if (video_ctx_) avcodec_send_packet(video_ctx_, nullptr);
-            if (audio_ctx_) avcodec_send_packet(audio_ctx_, nullptr);
+        if (!packet_pending_) {
+            int readRet = av_read_frame(fmt_ctx_, packet_);
+            if (readRet < 0) {
+                // End of stream (or a network error we can't distinguish
+                // from EOF here) -- flush both decoders so any frames
+                // they're internally holding onto get pushed out.
+                OSReport("Ufin: av_read_frame returned %d -- treating as end of stream\n", readRet);
+                reachedEof_ = true;
+                if (video_ctx_) avcodec_send_packet(video_ctx_, nullptr);
+                if (audio_ctx_) avcodec_send_packet(audio_ctx_, nullptr);
+                continue;
+            }
+            packet_pending_ = true;
+            send_retries_ = 0;
+        }
+
+        AVCodecContext* target = nullptr;
+        if (packet_->stream_index == video_stream_index_) {
+            target = video_ctx_;
+        } else if (packet_->stream_index == audio_stream_index_) {
+            target = audio_ctx_;
+        }
+
+        if (!target) {
+            // Packets from any other stream (e.g. a subtitle track we
+            // never opened a codec for) are just dropped here.
+            av_packet_unref(packet_);
+            packet_pending_ = false;
             continue;
         }
 
-        if (packet_->stream_index == video_stream_index_ && video_ctx_) {
-            avcodec_send_packet(video_ctx_, packet_);
-        } else if (packet_->stream_index == audio_stream_index_ && audio_ctx_) {
-            avcodec_send_packet(audio_ctx_, packet_);
+        int sendRet = avcodec_send_packet(target, packet_);
+        if (sendRet == AVERROR(EAGAIN) && send_retries_++ < 3) {
+            // Decoder wants us to drain output before accepting more
+            // input. Keep this packet pending and loop back to
+            // receive_frame() -- dropping it here (as the earlier code
+            // did) would lose a frame.
+            continue;
         }
-        // Packets from any other stream (e.g. a subtitle track we never
-        // opened a codec for) are just dropped here.
-
+        // Accepted -- or rejected outright, in which case the packet is
+        // unusable and dropping it is the only option.
         av_packet_unref(packet_);
+        packet_pending_ = false;
         // Loop back around to try receive_frame() again now that we've
         // fed in a new packet.
     }
+}
+
+double Decoder::frameTimeSeconds(DecodedFrameType type, const AVFrame* frame) const {
+    if (!frame || !fmt_ctx_) return NAN;
+
+    int streamIndex = -1;
+    if (type == DecodedFrameType::VIDEO) streamIndex = video_stream_index_;
+    else if (type == DecodedFrameType::AUDIO) streamIndex = audio_stream_index_;
+    if (streamIndex < 0) return NAN;
+
+    // best_effort_timestamp is FFmpeg's reconciled pts/dts guess -- for a
+    // clean transcode it simply equals pts, but it also copes with the
+    // occasional missing pts without us having to.
+    int64_t ts = frame->best_effort_timestamp;
+    if (ts == AV_NOPTS_VALUE) ts = frame->pts;
+    if (ts == AV_NOPTS_VALUE) return NAN;
+
+    return (double)ts * av_q2d(fmt_ctx_->streams[streamIndex]->time_base);
 }
 
 AVRational Decoder::videoTimeBase() const {
@@ -168,18 +247,32 @@ AVRational Decoder::videoTimeBase() const {
     return AVRational{1, 1};
 }
 
+double Decoder::videoFrameDuration() const {
+    if (video_stream_index_ < 0 || !fmt_ctx_) return 0.0;
+    AVRational fr = av_guess_frame_rate(fmt_ctx_, fmt_ctx_->streams[video_stream_index_], nullptr);
+    if (fr.num <= 0 || fr.den <= 0) return 0.0;
+    return (double)fr.den / (double)fr.num;
+}
+
+const char* Decoder::videoCodecName() const {
+    return (video_ctx_ && video_ctx_->codec) ? video_ctx_->codec->name : "none";
+}
+
 int Decoder::audioChannels() const {
     // NOTE: using the classic `channels` field rather than the newer
-    // AVChannelLayout (ch_layout) API -- this FFmpeg fork still emits
-    // deprecation warnings for similarly-aged APIs (refcounted_frames,
-    // av_oformat_next) rather than having removed them, which is why
-    // this field should still be valid here. If a future FFmpeg-wiiu
-    // update pulls in a newer FFmpeg release, this is the first thing
-    // to check if audio channel count comes back wrong.
+    // AVChannelLayout (ch_layout) API -- the FFmpeg-wiiu fork is based
+    // on FFmpeg 4.3 (libavcodec 58), where ch_layout doesn't exist yet.
+    // If a future FFmpeg-wiiu update pulls in FFmpeg 5.1+ this is the
+    // first thing to change (see also swr_alloc_set_opts in
+    // audio_output.cpp).
     return audio_ctx_ ? audio_ctx_->channels : 0;
 }
 
 void Decoder::close() {
+    if (packet_pending_) {
+        av_packet_unref(packet_);
+        packet_pending_ = false;
+    }
     if (video_ctx_) avcodec_free_context(&video_ctx_);
     if (audio_ctx_) avcodec_free_context(&audio_ctx_);
     if (fmt_ctx_) {
@@ -193,4 +286,5 @@ void Decoder::close() {
     video_stream_index_ = -1;
     audio_stream_index_ = -1;
     reachedEof_ = false;
+    video_decode_errors_ = 0;
 }
