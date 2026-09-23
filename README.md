@@ -18,7 +18,7 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 - ✅ Library browsing
 - ✅ Playback report to Jellyfin
 - ✅ Music playback
-- 🧪 Video playback (720p30 H.264 baseline + AAC, transcoded by the server; plays in Cemu, awaiting hardware testing)
+- 🧪 Video playback (720p30 H.264 baseline + AAC, transcoded by the server; plays in Cemu, Real Hardware only plays a frame when stopping playback, could be due to my console having bad WiFi)
 - 🧪 Live TV (channel list with what's on now; tuned and transcoded by the server)
 - ✅ Jellyfin 10.8 through 12.x (uses the modern `Authorization` header and `ApiKey` query parameter)
 - ❌ Full player controls (Pause, shuffle, play queue and seek are yet to be added)
@@ -156,3 +156,5 @@ Contributions and help are welcome, if any experienced developer wants to add so
 ## Credits
 
 Huge credit to https://github.com/GaryOderNichts/FFmpeg-wiiu for his work on FFmpeg for Wii U. Ufin uses this work for its Wii U FFmpeg backend.
+
+Another huge credit to https://github.com/LandValueGen for writing working video playback and a better UI
