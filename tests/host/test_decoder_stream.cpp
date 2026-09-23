@@ -75,7 +75,11 @@ static void checkStats(const RunStats& st, const char* label) {
     CHECK(st.openOk);
     CHECK_EQ(st.width, 320);
     CHECK_EQ(st.height, 240);
-    CHECK_NEAR(st.frameDuration, 1.0 / 30.0, 0.002);
+    // Without avformat_find_stream_info() (which crashed h264_wiiu, see
+    // Decoder::open) a fragmented MP4 with an empty moov has no frame
+    // rate yet: 0 = unknown, and Player falls back to 1/30 s -- the
+    // rate Ufin asks Jellyfin for. If it IS known it must be right.
+    CHECK(st.frameDuration == 0.0 || (st.frameDuration > 1.0 / 30.0 - 0.002 && st.frameDuration < 1.0 / 30.0 + 0.002));
     // 3 seconds at 30 fps; allow the encoder to trim a frame or two.
     CHECK(st.videoFrames >= 85 && st.videoFrames <= 92);
     // 3 seconds of AAC at 1024 samples / 48 kHz ~= 140 frames (+ priming).

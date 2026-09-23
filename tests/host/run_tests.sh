@@ -43,6 +43,8 @@ RUN_ARGS=""
 run test_ui        "$HERE/test_ui.cpp" "$SRC/ui/screens.cpp"
 run test_config    "$HERE/test_config.cpp" "$SRC/config_loader.cpp" "$SRC/vendor/cJSON.c"
 run test_jellyfin  "$HERE/test_jellyfin.cpp" "$SRC/jellyfin_client.cpp" "$SRC/http_client.cpp" "$SRC/vendor/cJSON.c"
+run test_grid_probe "$HERE/test_grid_probe.cpp"
+run test_item_labels "$HERE/test_item_labels.cpp" "$SRC/item_labels.cpp" "$SRC/ui/screens.cpp"
 
 if [ -n "${FFMPEG_HOST:-}" ] && [ -d "$FFMPEG_HOST/include/libavcodec" ]; then
     CXXFLAGS="$CXXFLAGS -I$FFMPEG_HOST/include"

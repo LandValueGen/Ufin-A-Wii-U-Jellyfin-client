@@ -1,8 +1,8 @@
-// Ufin -- browse Jellyfin libraries with the GamePad and play video/audio
-// via the media/ pipeline (HttpStreamIO -> Decoder -> VideoOutput/
-// AudioOutput -> Player). Menus are drawn with the ui/ layer on top of
-// OSScreen (ui/os_screen_display.h); video playback takes the display
-// over with GX2 for its duration.
+// Ufin -- browse Jellyfin libraries with the GamePad and play video,
+// audio and Live TV via the media/ pipeline (HttpStreamIO -> Decoder ->
+// VideoOutput/AudioOutput -> Player). Menus are drawn with the ui/ layer
+// on top of OSScreen (ui/os_screen_display.h); video playback takes the
+// display over with GX2 for its duration.
 
 #include <whb/proc.h>
 #include <vpad/input.h>
@@ -13,32 +13,40 @@
 #include <string>
 #include <cstdio>
 #include <cstdint>
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 #include "config.h"
 #include "jellyfin_client.h"
 #include "config_loader.h"
+#include "item_labels.h"
 #include "media/player.h"
 #include "media/video_output.h"
 #include "ui/screens.h"
 #include "ui/os_screen_display.h"
 
-enum class Screen { CONNECTING, ERROR_SCREEN, VIEWS, ITEMS };
-
-struct NavState {
-    Screen screen = Screen::CONNECTING;
-    std::vector<JellyfinItem> currentList;
-    int selectedIndex = 0;
-    std::string currentParentName;
-    std::string errorMessage;
-    bool usingDefaultConfig = false;
-    std::string configLoadError;
-    std::string configHost;
-    int configPort = 0;
+// One level of browsing. The whole path is kept on a stack with each
+// level's list and selection, so B goes back instantly to exactly where
+// you were instead of re-fetching (and losing your place).
+struct Frame {
+    enum class Kind { Views, Items, LiveTv };
+    Kind kind = Kind::Views;
+    std::string id;     // parent id for Items, empty otherwise
+    std::string title;  // shown in the breadcrumb
+    std::vector<JellyfinItem> items;
+    int selected = 0;
 };
 
 static OSScreenDisplay display;
 
-static const char* LIST_HINTS = "Up/Down: move    A: open / play    B: back    ZR: GX2 test";
+// Buttons that count as up/down: D-pad and the left stick.
+static const uint32_t BTN_UP = VPAD_BUTTON_UP | VPAD_STICK_L_EMULATION_UP;
+static const uint32_t BTN_DOWN = VPAD_BUTTON_DOWN | VPAD_STICK_L_EMULATION_DOWN;
+static const uint32_t BTN_PAGE_UP = VPAD_BUTTON_L | VPAD_BUTTON_LEFT | VPAD_STICK_L_EMULATION_LEFT;
+static const uint32_t BTN_PAGE_DOWN = VPAD_BUTTON_R | VPAD_BUTTON_RIGHT | VPAD_STICK_L_EMULATION_RIGHT;
 
 static void showMessage(const std::string& title, const std::vector<std::string>& lines,
                         const std::string& footer, bool isError = false) {
@@ -50,57 +58,55 @@ static void showMessage(const std::string& title, const std::vector<std::string>
     display.render([&](ui::Surface& s) { ui::drawMessageScreen(s, model); });
 }
 
-static void renderNav(const NavState& nav) {
-    if (nav.screen == Screen::CONNECTING) {
-        char buf[160];
-        snprintf(buf, sizeof(buf), "Connecting to %s:%d ...", nav.configHost.c_str(), nav.configPort);
-        std::vector<std::string> lines;
-        lines.push_back(buf);
-        if (nav.usingDefaultConfig) {
-            lines.push_back("");
-            lines.push_back(nav.configLoadError + " -- using the hardcoded config.h defaults.");
-        }
-        showMessage("Ufin", lines, "");
-        return;
-    }
+static void showError(const std::string& message) {
+    showMessage("Ufin  |  Error",
+                {message, "",
+                 "Check config.json (host / port / credentials) and that the Wii U and the "
+                 "Jellyfin server are on the same network."},
+                "B: back", true);
+}
 
-    if (nav.screen == Screen::ERROR_SCREEN) {
-        std::vector<std::string> lines;
-        lines.push_back(nav.errorMessage);
-        lines.push_back("");
-        lines.push_back("Check config.json (host / port / credentials) and that the");
-        lines.push_back("Wii U and the Jellyfin server are on the same network.");
-        showMessage("Ufin  |  Error", lines, "B: back to libraries", true);
-        return;
+static std::string breadcrumb(const std::vector<Frame>& stack) {
+    if (stack.size() <= 1) return "Libraries";
+    std::string out;
+    for (size_t i = 1; i < stack.size(); i++) {
+        if (!out.empty()) out += " > ";
+        out += stack[i].title;
     }
+    return out;
+}
 
+static void renderList(const std::vector<Frame>& stack) {
+    const Frame& f = stack.back();
     ui::ListScreenModel model;
     model.title = "Ufin";
-    model.location = nav.currentParentName.empty() ? "Libraries" : nav.currentParentName;
-    model.selectedIndex = nav.selectedIndex;
-    model.footer = LIST_HINTS;
-    model.items.reserve(nav.currentList.size());
-    for (const JellyfinItem& item : nav.currentList) {
+    model.location = breadcrumb(stack);
+    model.selectedIndex = f.selected;
+    model.footer = stack.size() > 1 ? "A: open    B: back    L/R: page    Y: refresh"
+                                    : "A: open    L/R: page    Y: refresh";
+    if (f.kind == Frame::Kind::LiveTv) model.emptyMessage = "No channels. Set up a tuner in Jellyfin.";
+    model.items.reserve(f.items.size());
+    for (const JellyfinItem& item : f.items) {
         ui::ListEntry e;
-        e.name = item.name;
-        e.tag = item.type;
-        if (item.runTimeTicks > 0 && (item.type == "Audio" || item.type == "Movie" ||
-                                      item.type == "Episode" || item.type == "Video")) {
-            e.tag = ui::formatTime((double)item.runTimeTicks / 10000000.0) + "  " + item.type;
-        }
+        e.name = itemDisplayName(item);
+        e.tag = itemTag(item);
+        e.detail = itemDetail(item);
         model.items.push_back(e);
     }
     display.render([&](ui::Surface& s) { ui::drawListScreen(s, model); });
 }
 
-// True if this item type is something Player can actually play, rather
-// than a folder to browse into. "Audio" goes through
-// buildAudioStreamUrl() (AAC-in-MP4, confirmed working); everything else
-// through buildVideoStreamUrl() (H.264 baseline + AAC in fragmented MP4,
-// decoded by the Wii U hardware decoder via h264_wiiu and drawn with the
-// GX2 NV12 renderer).
-static bool isPlayable(const std::string& type) {
-    return type == "Movie" || type == "Episode" || type == "Video" || type == "Audio";
+// (Re)loads a frame's items from the server. Keeps the selection in range.
+static bool loadFrame(JellyfinClient& client, Frame& f) {
+    bool ok = false;
+    switch (f.kind) {
+        case Frame::Kind::Views:  ok = client.getViews(f.items); break;
+        case Frame::Kind::Items:  ok = client.getItems(f.id, f.items); break;
+        case Frame::Kind::LiveTv: ok = client.getLiveTvChannels(f.items); break;
+    }
+    if (f.selected >= (int)f.items.size()) f.selected = (int)f.items.size() - 1;
+    if (f.selected < 0) f.selected = 0;
+    return ok;
 }
 
 // Polled by Player many times a second. Also keeps ProcUI serviced --
@@ -137,45 +143,113 @@ static void runGx2TestPattern() {
     display.init();
 }
 
+// Sends Jellyfin's "still playing" progress reports from a background
+// thread. They used to be sent from Player's onTick, which runs on the
+// render loop: every report is a full blocking HTTP round trip (a fresh
+// connection, then waiting for the server), so the picture froze for as
+// long as Jellyfin took to answer, once a second. Now the render loop
+// only stores the position, and this thread posts it every 10 seconds
+// -- the interval Jellyfin's own clients use.
+class ProgressReporter {
+public:
+    ProgressReporter(JellyfinClient& client, std::string itemId, PlaybackIds ids)
+        : client_(client), itemId_(std::move(itemId)), ids_(std::move(ids)),
+          thread_([this] { run(); }) {}
+
+    ~ProgressReporter() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        wake_.notify_all();
+        thread_.join();
+    }
+
+    void update(double positionSeconds) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        position_ = positionSeconds;
+    }
+
+private:
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (!stop_) {
+            wake_.wait_for(lock, std::chrono::seconds(10), [this] { return stop_; });
+            if (stop_) break;
+            int64_t ticks = (int64_t)(position_ * 10000000.0);
+            lock.unlock();
+            client_.reportPlaybackProgress(itemId_, ticks, ids_);
+            lock.lock();
+        }
+    }
+
+    JellyfinClient& client_;
+    std::string itemId_;
+    PlaybackIds ids_;
+    double position_ = 0.0; // guarded by mutex_ (a 64-bit atomic would need libatomic on PPC)
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    bool stop_ = false;
+    std::thread thread_;
+};
+
 // Plays one item start to finish (or until B), handling the OSScreen/GX2
-// hand-off and Jellyfin progress reporting. Returns the player result and
-// fills errorMessage on PlayResult::Error.
+// hand-off, Live TV tuning and Jellyfin progress reporting. Returns the
+// player result and fills errorMessage on PlayResult::Error.
 static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const JellyfinItem& picked,
                            std::string& errorMessage) {
     const bool isAudio = (picked.type == "Audio");
+    const bool isLive = (picked.type == "TvChannel");
 
     VideoStreamOptions videoOptions;
     videoOptions.videoBitrate = cfg.videoBitrate;
     videoOptions.profile = cfg.videoProfile;
 
-    StreamTarget target = isAudio
-        ? client.buildAudioStreamUrl(picked.id)
-        : client.buildVideoStreamUrl(picked.id, videoOptions);
-
     double durationSeconds = picked.runTimeTicks > 0 ? picked.runTimeTicks / 10000000.0 : 0.0;
-
     PlayOptions playOptions;
-    {
-        std::vector<std::string> lines;
-        lines.push_back(picked.name);
-        lines.push_back("");
-        lines.push_back("Waiting for the server to start streaming...");
-        showMessage("Ufin  |  Loading", lines, "B: cancel");
-    }
+    PlaybackIds ids;
 
-    if (!isAudio) {
+    showMessage(isLive ? "Ufin  |  Tuning" : "Ufin  |  Loading",
+                {itemDisplayName(picked), "",
+                 isLive ? "Asking the server to tune the channel and start the transcode..."
+                        : "Waiting for the server to start streaming..."},
+                "Please wait");
+
+    if (isLive) {
+        // Live TV needs the tuner opened first; the stream endpoint then
+        // wants the ids that come back.
+        LiveStreamSession live;
+        if (!client.openLiveStream(picked.id, cfg.videoBitrate, live)) {
+            errorMessage = "Could not open the channel: " + client.lastError();
+            return PlayResult::Error;
+        }
+        videoOptions.mediaSourceId = live.mediaSourceId;
+        videoOptions.liveStreamId = live.liveStreamId;
+        videoOptions.playSessionId = live.playSessionId;
+        playOptions.displayAspect = live.info.displayAspect > 0.0 ? live.info.displayAspect : 16.0 / 9.0;
+        durationSeconds = 0.0;
+    } else if (!isAudio) {
         // Jellyfin is asked to encode every video at exactly 1280x720
         // (see buildVideoStreamUrl for why), so the real shape of the
         // picture has to come from the item's metadata. If we can't get
         // it, assume 16:9.
         VideoInfo info;
-        if (client.getVideoInfo(picked.id, info) && info.displayAspect > 0.0) {
-            playOptions.displayAspect = info.displayAspect;
+        if (client.getVideoInfo(picked.id, info)) {
+            videoOptions.mediaSourceId = info.mediaSourceId;
             if (info.runTimeTicks > 0) durationSeconds = info.runTimeTicks / 10000000.0;
-        } else {
-            playOptions.displayAspect = 16.0 / 9.0;
         }
+        playOptions.displayAspect = info.displayAspect > 0.0 ? info.displayAspect : 16.0 / 9.0;
+    }
 
+    ids.mediaSourceId = videoOptions.mediaSourceId;
+    ids.liveStreamId = videoOptions.liveStreamId;
+    ids.playSessionId = videoOptions.playSessionId;
+
+    StreamTarget target = isAudio
+        ? client.buildAudioStreamUrl(picked.id)
+        : client.buildVideoStreamUrl(picked.id, videoOptions);
+
+    if (!isAudio) {
         // OSScreen and GX2 both drive the same display hardware; both
         // active at once caused a hard OSFatal hang on Cemu and real
         // hardware. Tear OSScreen down for the duration of video
@@ -184,21 +258,24 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
         display.shutdown();
     }
 
-    client.reportPlaybackStart(picked.id);
+    client.reportPlaybackStart(picked.id, ids);
 
     Player player;
-    PlayResult result = player.play(target.host, target.port, target.path,
+    PlayResult result;
+    {
+    ProgressReporter reporter(client, picked.id, ids);
+    result = player.play(target.host, target.port, target.path,
         stopRequestedByUser,
         [&](double positionSeconds) {
             // Roughly once per second with the real playback position
-            // (from the audio clock). Ping Jellyfin so its own UI shows
-            // this as actively playing, and for audio redraw Now Playing.
-            int64_t positionTicks = (int64_t)(positionSeconds * 10000000.0);
-            client.reportPlaybackProgress(picked.id, positionTicks);
+            // (from the audio clock), on the render loop -- so nothing
+            // slow here. The reporter thread tells Jellyfin; for audio,
+            // redraw Now Playing.
+            reporter.update(positionSeconds);
 
             if (isAudio) {
                 ui::NowPlayingModel model;
-                model.title = picked.name;
+                model.title = itemDisplayName(picked);
                 model.subtitle = "Audio  |  AAC transcode";
                 model.positionSeconds = positionSeconds;
                 model.durationSeconds = durationSeconds;
@@ -207,8 +284,10 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
             }
         },
         playOptions);
+    } // reporter stops here, before the final report
 
-    client.reportPlaybackStopped(picked.id, (int64_t)(player.positionSeconds() * 10000000.0));
+    client.reportPlaybackStopped(picked.id, (int64_t)(player.positionSeconds() * 10000000.0), ids);
+    if (isLive) client.closeLiveStream(ids.liveStreamId);
 
     if (!isAudio) {
         display.init();
@@ -218,6 +297,35 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
         errorMessage = "Playback error: " + player.lastError();
     }
     return result;
+}
+
+// Up/down auto-repeat while held: first repeat after 400 ms, then every
+// 70 ms -- scrolling a 500-movie library one press at a time is no fun.
+struct RepeatState {
+    uint32_t button = 0;
+    OSTime pressedAt = 0;
+    OSTime lastFire = 0;
+};
+
+static uint32_t withRepeat(const VPADStatus& vpad, RepeatState& rs) {
+    uint32_t fired = vpad.trigger;
+    OSTime now = OSGetTime();
+    const uint32_t repeatable = BTN_UP | BTN_DOWN;
+
+    if (vpad.trigger & repeatable) {
+        rs.button = vpad.trigger & repeatable;
+        rs.pressedAt = now;
+        rs.lastFire = now;
+    } else if (rs.button && (vpad.hold & rs.button)) {
+        if (OSTicksToMilliseconds(now - rs.pressedAt) >= 400 &&
+            OSTicksToMilliseconds(now - rs.lastFire) >= 70) {
+            fired |= rs.button;
+            rs.lastFire = now;
+        }
+    } else {
+        rs.button = 0;
+    }
+    return fired;
 }
 
 int main(int argc, char** argv) {
@@ -236,29 +344,35 @@ int main(int argc, char** argv) {
 
     JellyfinClient client(cfg.host, cfg.port);
 
-    NavState nav;
-    nav.usingDefaultConfig = usingDefaults;
-    nav.configLoadError = configError;
-    nav.configHost = cfg.host;
-    nav.configPort = cfg.port;
-    std::vector<std::pair<std::string, std::string>> navStack;
-
-    renderNav(nav);
-
-    if (!client.authenticate(cfg.username, cfg.password)) {
-        nav.screen = Screen::ERROR_SCREEN;
-        nav.errorMessage = client.lastError();
-    } else if (!client.getViews(nav.currentList)) {
-        nav.screen = Screen::ERROR_SCREEN;
-        nav.errorMessage = client.lastError();
-    } else {
-        nav.screen = Screen::VIEWS;
-        nav.selectedIndex = 0;
+    {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "Connecting to %s:%d ...", cfg.host.c_str(), cfg.port);
+        std::vector<std::string> lines = {buf};
+        if (usingDefaults) {
+            lines.push_back("");
+            lines.push_back(configError + " -- using the built-in config.h defaults.");
+        }
+        showMessage("Ufin", lines, "Please wait");
     }
-    renderNav(nav);
+
+    std::vector<Frame> stack(1);
+    stack[0].kind = Frame::Kind::Views;
+    stack[0].title = "Libraries";
+
+    // Non-empty = an error screen is showing over the current list.
+    std::string errorMessage;
+    bool loggedIn = client.authenticate(cfg.username, cfg.password);
+    if (!loggedIn) {
+        errorMessage = client.lastError();
+    } else if (!loadFrame(client, stack[0])) {
+        errorMessage = client.lastError();
+    }
+
+    if (errorMessage.empty()) renderList(stack); else showError(errorMessage);
 
     VPADStatus vpad;
     VPADReadError vpadError;
+    RepeatState repeat;
 
     while (WHBProcIsRunning()) {
         VPADRead(VPAD_CHAN_0, &vpad, 1, &vpadError);
@@ -266,96 +380,76 @@ int main(int argc, char** argv) {
             OSSleepTicks(OSMillisecondsToTicks(16));
             continue;
         }
-
-        if (vpad.trigger & VPAD_BUTTON_ZR) {
-            runGx2TestPattern();
-            renderNav(nav);
-            continue;
-        }
-
+        const uint32_t pressed = withRepeat(vpad, repeat);
         bool changed = false;
 
-        if (nav.screen == Screen::VIEWS || nav.screen == Screen::ITEMS) {
-            if (vpad.trigger & VPAD_BUTTON_DOWN) {
-                if (!nav.currentList.empty()) {
-                    nav.selectedIndex = (nav.selectedIndex + 1) % (int)nav.currentList.size();
-                    changed = true;
+        if (!errorMessage.empty()) {
+            // Error screen: B dismisses it. If we never got in, B retries
+            // the login instead (e.g. after starting the server).
+            if (pressed & VPAD_BUTTON_B) {
+                errorMessage.clear();
+                if (!loggedIn) {
+                    showMessage("Ufin", {"Retrying..."}, "Please wait");
+                    loggedIn = client.authenticate(cfg.username, cfg.password);
+                    if (!loggedIn || !loadFrame(client, stack[0])) errorMessage = client.lastError();
                 }
-            } else if (vpad.trigger & VPAD_BUTTON_UP) {
-                if (!nav.currentList.empty()) {
-                    nav.selectedIndex--;
-                    if (nav.selectedIndex < 0) nav.selectedIndex = (int)nav.currentList.size() - 1;
-                    changed = true;
-                }
-            } else if (vpad.trigger & VPAD_BUTTON_A) {
-                if (!nav.currentList.empty()) {
-                    // Copy: playItem() may take minutes and nav is redrawn after.
-                    const JellyfinItem picked = nav.currentList[(size_t)nav.selectedIndex];
-
-                    if (isPlayable(picked.type)) {
-                        std::string error;
-                        if (playItem(client, cfg, picked, error) == PlayResult::Error) {
-                            nav.screen = Screen::ERROR_SCREEN;
-                            nav.errorMessage = error;
-                        }
-                        // Completed/Stopped: nav is untouched, so we're
-                        // still looking at the list we picked from.
-                        changed = true;
-                    } else {
-                        std::vector<JellyfinItem> nextList;
-                        if (client.getItems(picked.id, nextList)) {
-                            navStack.push_back({picked.id, nav.currentParentName});
-                            nav.currentParentName = picked.name;
-                            nav.currentList = nextList;
-                            nav.selectedIndex = 0;
-                            nav.screen = Screen::ITEMS;
-                        } else {
-                            nav.screen = Screen::ERROR_SCREEN;
-                            nav.errorMessage = client.lastError();
-                        }
-                        changed = true;
-                    }
-                }
-            } else if (vpad.trigger & VPAD_BUTTON_B) {
-                if (!navStack.empty()) {
-                    auto parent = navStack.back();
-                    navStack.pop_back();
-
-                    if (navStack.empty()) {
-                        if (client.getViews(nav.currentList)) {
-                            nav.currentParentName = "";
-                            nav.screen = Screen::VIEWS;
-                        } else {
-                            nav.screen = Screen::ERROR_SCREEN;
-                            nav.errorMessage = client.lastError();
-                        }
-                    } else {
-                        if (client.getItems(parent.first, nav.currentList)) {
-                            nav.currentParentName = parent.second;
-                            nav.screen = Screen::ITEMS;
-                        } else {
-                            nav.screen = Screen::ERROR_SCREEN;
-                            nav.errorMessage = client.lastError();
-                        }
-                    }
-                    nav.selectedIndex = 0;
-                    changed = true;
-                }
+                changed = true;
             }
-        } else if (nav.screen == Screen::ERROR_SCREEN) {
-            if (vpad.trigger & VPAD_BUTTON_B) {
-                if (client.getViews(nav.currentList)) {
-                    nav.screen = Screen::VIEWS;
-                    nav.currentParentName = "";
-                    navStack.clear();
-                    nav.selectedIndex = 0;
-                    changed = true;
+        } else if (pressed & VPAD_BUTTON_ZR) {
+            runGx2TestPattern();
+            changed = true;
+        } else {
+            Frame& f = stack.back();
+            const int count = (int)f.items.size();
+            const int page = 10;
+
+            if ((pressed & BTN_DOWN) && count > 0) {
+                f.selected = (f.selected + 1) % count;
+                changed = true;
+            } else if ((pressed & BTN_UP) && count > 0) {
+                f.selected = (f.selected - 1 + count) % count;
+                changed = true;
+            } else if ((pressed & BTN_PAGE_DOWN) && count > 0) {
+                f.selected = std::min(f.selected + page, count - 1);
+                changed = true;
+            } else if ((pressed & BTN_PAGE_UP) && count > 0) {
+                f.selected = std::max(f.selected - page, 0);
+                changed = true;
+            } else if (pressed & VPAD_BUTTON_Y) {
+                showMessage("Ufin", {"Refreshing..."}, "Please wait");
+                if (!loadFrame(client, f)) errorMessage = client.lastError();
+                changed = true;
+            } else if ((pressed & VPAD_BUTTON_A) && count > 0) {
+                // Copy: playItem() may take minutes and the stack can
+                // reallocate when we push.
+                const JellyfinItem picked = f.items[(size_t)f.selected];
+
+                if (isPlayableItem(picked)) {
+                    std::string error;
+                    if (playItem(client, cfg, picked, error) == PlayResult::Error) {
+                        errorMessage = error;
+                    }
+                } else {
+                    Frame next;
+                    next.kind = isLiveTvView(picked) ? Frame::Kind::LiveTv : Frame::Kind::Items;
+                    next.id = picked.id;
+                    next.title = picked.name;
+                    showMessage("Ufin", {"Opening " + picked.name + " ..."}, "Please wait");
+                    if (loadFrame(client, next)) {
+                        stack.push_back(next);
+                    } else {
+                        errorMessage = client.lastError();
+                    }
                 }
+                changed = true;
+            } else if ((pressed & VPAD_BUTTON_B) && stack.size() > 1) {
+                stack.pop_back();
+                changed = true;
             }
         }
 
         if (changed) {
-            renderNav(nav);
+            if (errorMessage.empty()) renderList(stack); else showError(errorMessage);
         }
 
         OSSleepTicks(OSMillisecondsToTicks(16));

@@ -60,6 +60,9 @@ private:
     uint32_t drcSize_ = 0;
     OSScreenSurface tv_{SCREEN_TV, 1280, 720};
     OSScreenSurface drc_{SCREEN_DRC, 854, 480};
+    bool gridMeasured_ = false;
+    ui::GridMetrics tvGrid_;
+    ui::GridMetrics drcGrid_;
 
     void flip();
 };

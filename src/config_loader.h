@@ -4,9 +4,8 @@
 // file is missing, unreadable, or malformed -- callers should treat a
 // false return as "use the hardcoded defaults", not a fatal error.
 //
-// This is real-hardware-only in practice: Cemu doesn't emulate an SD
-// card by default, so config.h's hardcoded values remain the practical
-// way to configure a Cemu test build.
+// Cemu maps sd:/ to its own sdcard folder (e.g. ~/.local/share/Cemu/sdcard
+// on Linux), so the same config.json works in the emulator too.
 
 #pragma once
 #include <string>

@@ -168,9 +168,25 @@ bool HttpStreamReader::open() {
     size_t sp1 = statusLine.find(' ');
     int statusCode = (sp1 != std::string::npos) ? atoi(statusLine.c_str() + sp1 + 1) : 0;
     if (statusCode != 200) {
-        last_error_ = "server returned status " + std::to_string(statusCode) +
-                       " (expected 200 for a live transcode stream)";
-        OSReport("Ufin: unexpected status code %d\n", statusCode);
+        // Jellyfin usually says *why* in the body (e.g. the FFmpeg
+        // failure), so grab the start of it for the log and the error
+        // screen instead of throwing it away.
+        std::string line;
+        while (readLine(line) && !line.empty()) {}
+        std::string body;
+        if (sock_buf_pos_ < sock_buf_len_ || waitReadable(sock_, 2)) {
+            if (fillSockBuf()) {
+                size_t avail = sock_buf_len_ - sock_buf_pos_;
+                body.assign((const char*)sock_buf_.data() + sock_buf_pos_,
+                            std::min<size_t>(avail, 300));
+            }
+        }
+        for (char& c : body) {
+            if ((unsigned char)c < 0x20) c = ' ';
+        }
+        OSReport("Ufin: unexpected status code %d, body: %s\n", statusCode, body.c_str());
+        last_error_ = "server returned status " + std::to_string(statusCode);
+        if (!body.empty()) last_error_ += ": " + body.substr(0, 120);
         return false;
     }
 

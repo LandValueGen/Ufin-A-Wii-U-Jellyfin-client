@@ -14,13 +14,48 @@ std::string JellyfinClient::authHeader() const {
     // Jellyfin expects this identifying header on basically every request.
     // DeviceId should stay stable across launches so Jellyfin treats it as
     // the same device (matters for resume points / "continue watching").
-    std::string h = "X-Emby-Authorization: MediaBrowser Client=\"Ufin\", "
-                     "Device=\"WiiU\", DeviceId=\"wiiu-ufin-001\", Version=\"0.1.0\"";
+    //
+    // "Authorization: MediaBrowser ..." rather than the old
+    // X-Emby-Authorization header: Jellyfin 12 disables the legacy
+    // authorization methods by default (EnableLegacyAuthorization=false),
+    // ignores X-Emby-Authorization, and then rejects the login with a 400
+    // because no client/device info arrived. The Authorization form has
+    // been accepted since Jellyfin 10.8.
+    std::string h = "Authorization: MediaBrowser Client=\"Ufin\", "
+                    "Device=\"WiiU\", DeviceId=\"wiiu-ufin-001\", Version=\"0.1.0\"";
     if (!token_.empty()) {
         h += ", Token=\"" + token_ + "\"";
     }
     h += "\r\n";
     return h;
+}
+
+// Query-string escaping for ids we didn't generate ourselves (live
+// stream ids, play session ids). Jellyfin item ids are plain hex, but
+// there's no promise about the others.
+static std::string urlEncode(const std::string& in) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string out;
+    for (unsigned char c : in) {
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += (char)c;
+        } else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+    }
+    return out;
+}
+
+static std::string jsonString(cJSON* obj, const char* key) {
+    cJSON* v = cJSON_GetObjectItem(obj, key);
+    return cJSON_IsString(v) ? std::string(v->valuestring) : std::string();
+}
+
+static int jsonInt(cJSON* obj, const char* key, int fallback) {
+    cJSON* v = cJSON_GetObjectItem(obj, key);
+    return cJSON_IsNumber(v) ? v->valueint : fallback;
 }
 
 bool JellyfinClient::authenticate(const std::string& username, const std::string& password) {
@@ -63,22 +98,23 @@ bool JellyfinClient::authenticate(const std::string& username, const std::string
 }
 
 static void parseItemsArray(cJSON* items, std::vector<JellyfinItem>& out) {
-    out.clear(); // was missing -- caller passes the same vector across
-                 // calls (e.g. nav.currentList), so without this each
-                 // new fetch appended onto whatever was already there
-                 // instead of replacing it.
+    out.clear(); // callers reuse the same vector across fetches
     if (!items) return;
     cJSON* item;
     cJSON_ArrayForEach(item, items) {
         JellyfinItem ji;
-        cJSON* id = cJSON_GetObjectItem(item, "Id");
-        cJSON* name = cJSON_GetObjectItem(item, "Name");
-        cJSON* type = cJSON_GetObjectItem(item, "Type");
+        ji.id = jsonString(item, "Id");
+        ji.name = jsonString(item, "Name");
+        ji.type = jsonString(item, "Type");
+        ji.collectionType = jsonString(item, "CollectionType");
         cJSON* runTime = cJSON_GetObjectItem(item, "RunTimeTicks");
-        if (cJSON_IsString(id)) ji.id = id->valuestring;
-        if (cJSON_IsString(name)) ji.name = name->valuestring;
-        if (cJSON_IsString(type)) ji.type = type->valuestring;
         if (cJSON_IsNumber(runTime)) ji.runTimeTicks = (int64_t)runTime->valuedouble;
+        ji.indexNumber = jsonInt(item, "IndexNumber", -1);
+        ji.parentIndexNumber = jsonInt(item, "ParentIndexNumber", -1);
+        ji.productionYear = jsonInt(item, "ProductionYear", 0);
+        ji.channelNumber = jsonString(item, "ChannelNumber");
+        cJSON* program = cJSON_GetObjectItem(item, "CurrentProgram");
+        if (cJSON_IsObject(program)) ji.currentProgram = jsonString(program, "Name");
         out.push_back(ji);
     }
 }
@@ -111,6 +147,24 @@ bool JellyfinClient::getItems(const std::string& parentId, std::vector<JellyfinI
     cJSON* json = cJSON_Parse(resp.body.c_str());
     if (!json) {
         last_error_ = "could not parse items JSON";
+        return false;
+    }
+    parseItemsArray(cJSON_GetObjectItem(json, "Items"), out);
+    cJSON_Delete(json);
+    return true;
+}
+
+bool JellyfinClient::getLiveTvChannels(std::vector<JellyfinItem>& out) {
+    std::string path = "/LiveTv/Channels?UserId=" + user_id_ +
+                       "&AddCurrentProgram=true&EnableImages=false&EnableUserData=false";
+    HttpResponse resp = http_get(host_, port_, path, authHeader());
+    if (!resp.success) {
+        last_error_ = "getLiveTvChannels failed (status " + std::to_string(resp.status_code) + ")";
+        return false;
+    }
+    cJSON* json = cJSON_Parse(resp.body.c_str());
+    if (!json) {
+        last_error_ = "could not parse channels JSON";
         return false;
     }
     parseItemsArray(cJSON_GetObjectItem(json, "Items"), out);
@@ -176,10 +230,12 @@ bool JellyfinClient::getVideoInfo(const std::string& itemId, VideoInfo& out) {
     if (cJSON_IsNumber(h) && h->valueint > 0) out.height = h->valueint;
 
     parseVideoStream(cJSON_GetObjectItem(json, "MediaStreams"), out);
-    if (out.displayAspect <= 0.0) {
-        cJSON* sources = cJSON_GetObjectItem(json, "MediaSources");
-        if (cJSON_IsArray(sources) && cJSON_GetArraySize(sources) > 0) {
-            parseVideoStream(cJSON_GetObjectItem(cJSON_GetArrayItem(sources, 0), "MediaStreams"), out);
+    cJSON* sources = cJSON_GetObjectItem(json, "MediaSources");
+    if (cJSON_IsArray(sources) && cJSON_GetArraySize(sources) > 0) {
+        cJSON* first = cJSON_GetArrayItem(sources, 0);
+        out.mediaSourceId = jsonString(first, "Id");
+        if (out.displayAspect <= 0.0) {
+            parseVideoStream(cJSON_GetObjectItem(first, "MediaStreams"), out);
         }
     }
 
@@ -189,6 +245,72 @@ bool JellyfinClient::getVideoInfo(const std::string& itemId, VideoInfo& out) {
 
     cJSON_Delete(json);
     return true;
+}
+
+bool JellyfinClient::openLiveStream(const std::string& channelId, int maxBitrate,
+                                    LiveStreamSession& out) {
+    out = LiveStreamSession{};
+
+    cJSON* body = cJSON_CreateObject();
+    cJSON_AddStringToObject(body, "UserId", user_id_.c_str());
+    cJSON_AddBoolToObject(body, "IsPlayback", true);
+    cJSON_AddBoolToObject(body, "AutoOpenLiveStream", true);
+    cJSON_AddNumberToObject(body, "MaxStreamingBitrate", (double)maxBitrate);
+    cJSON_AddBoolToObject(body, "EnableDirectPlay", false);
+    cJSON_AddBoolToObject(body, "EnableDirectStream", false);
+    cJSON_AddBoolToObject(body, "EnableTranscoding", true);
+    cJSON_AddBoolToObject(body, "AllowVideoStreamCopy", false);
+    cJSON_AddBoolToObject(body, "AllowAudioStreamCopy", false);
+    char* bodyStr = cJSON_PrintUnformatted(body);
+
+    std::string path = "/Items/" + channelId + "/PlaybackInfo?UserId=" + user_id_ +
+                       "&IsPlayback=true&AutoOpenLiveStream=true&StartTimeTicks=0";
+    HttpResponse resp = http_post(host_, port_, path, bodyStr, "application/json", authHeader());
+    free(bodyStr);
+    cJSON_Delete(body);
+
+    if (!resp.success) {
+        last_error_ = "opening the channel failed (status " + std::to_string(resp.status_code) + ")";
+        return false;
+    }
+    cJSON* json = cJSON_Parse(resp.body.c_str());
+    if (!json) {
+        last_error_ = "could not parse PlaybackInfo JSON";
+        return false;
+    }
+
+    std::string errorCode = jsonString(json, "ErrorCode");
+    cJSON* sources = cJSON_GetObjectItem(json, "MediaSources");
+    if (!errorCode.empty() || !cJSON_IsArray(sources) || cJSON_GetArraySize(sources) == 0) {
+        last_error_ = errorCode.empty() ? "server returned no media source for this channel"
+                                        : "server refused the channel: " + errorCode;
+        cJSON_Delete(json);
+        return false;
+    }
+
+    cJSON* first = cJSON_GetArrayItem(sources, 0);
+    out.mediaSourceId = jsonString(first, "Id");
+    out.liveStreamId = jsonString(first, "LiveStreamId");
+    out.playSessionId = jsonString(json, "PlaySessionId");
+    out.info.mediaSourceId = out.mediaSourceId;
+    parseVideoStream(cJSON_GetObjectItem(first, "MediaStreams"), out.info);
+    if (out.info.displayAspect <= 0.0 && out.info.width > 0 && out.info.height > 0) {
+        out.info.displayAspect = (double)out.info.width / (double)out.info.height;
+    }
+    cJSON_Delete(json);
+
+    if (out.mediaSourceId.empty()) {
+        last_error_ = "channel media source has no id";
+        return false;
+    }
+    return true;
+}
+
+bool JellyfinClient::closeLiveStream(const std::string& liveStreamId) {
+    if (liveStreamId.empty()) return true;
+    HttpResponse resp = http_post(host_, port_, "/LiveStreams/Close?liveStreamId=" + urlEncode(liveStreamId),
+                                  "", "application/json", authHeader());
+    return resp.success;
 }
 
 StreamTarget JellyfinClient::buildAudioStreamUrl(const std::string& itemId) const {
@@ -205,7 +327,7 @@ StreamTarget JellyfinClient::buildAudioStreamUrl(const std::string& itemId) cons
     char pathBuf[900];
     snprintf(pathBuf, sizeof(pathBuf),
         "/Audio/%s/stream.mp4?static=false&AudioCodec=aac&AudioBitrate=192000"
-        "&api_key=%s",
+        "&ApiKey=%s",
         itemId.c_str(), token_.c_str());
     target.path = pathBuf;
     return target;
@@ -272,24 +394,30 @@ StreamTarget JellyfinClient::buildVideoStreamUrl(const std::string& itemId,
         "&Width=1280&Height=720&VideoBitrate=%d&AudioBitrate=192000"
         "&Profile=%s&Level=41&MaxFramerate=30&MaxAudioChannels=2"
         "&AllowVideoStreamCopy=false&AllowAudioStreamCopy=false"
-        "&api_key=%s",
+        "&ApiKey=%s",
         itemId.c_str(), bitrate, profile.c_str(), token_.c_str());
     target.path = pathBuf;
+
+    // ApiKey (not api_key): Jellyfin 12 only accepts the new spelling
+    // once legacy authorization is off; 10.8+ read it too.
+    if (!options.mediaSourceId.empty()) target.path += "&MediaSourceId=" + urlEncode(options.mediaSourceId);
+    if (!options.liveStreamId.empty()) target.path += "&LiveStreamId=" + urlEncode(options.liveStreamId);
+    if (!options.playSessionId.empty()) target.path += "&PlaySessionId=" + urlEncode(options.playSessionId);
     return target;
 }
 
 static bool postSessionEvent(const std::string& host, int port, const std::string& authHeader,
                               const std::string& endpoint, const std::string& itemId,
-                              int64_t positionTicks, bool includePosition) {
+                              int64_t positionTicks, bool includePosition, const PlaybackIds& ids) {
     cJSON* body = cJSON_CreateObject();
     cJSON_AddStringToObject(body, "ItemId", itemId.c_str());
     cJSON_AddBoolToObject(body, "CanSeek", false);
     cJSON_AddStringToObject(body, "PlayMethod", "Transcode");
+    if (!ids.mediaSourceId.empty()) cJSON_AddStringToObject(body, "MediaSourceId", ids.mediaSourceId.c_str());
+    if (!ids.liveStreamId.empty()) cJSON_AddStringToObject(body, "LiveStreamId", ids.liveStreamId.c_str());
+    if (!ids.playSessionId.empty()) cJSON_AddStringToObject(body, "PlaySessionId", ids.playSessionId.c_str());
     if (includePosition) {
-        // cJSON's number type is a double -- fine here, ticks values in
-        // our use (elapsed playback seconds * 10,000,000) stay well
-        // within double's exact-integer range for any realistic
-        // playback duration.
+        // cJSON numbers are doubles -- exact for any realistic tick count.
         cJSON_AddNumberToObject(body, "PositionTicks", (double)positionTicks);
     }
     char* bodyStr = cJSON_PrintUnformatted(body);
@@ -300,16 +428,18 @@ static bool postSessionEvent(const std::string& host, int port, const std::strin
     return resp.success;
 }
 
-bool JellyfinClient::reportPlaybackStart(const std::string& itemId) {
-    return postSessionEvent(host_, port_, authHeader(), "/Sessions/Playing", itemId, 0, false);
+bool JellyfinClient::reportPlaybackStart(const std::string& itemId, const PlaybackIds& ids) {
+    return postSessionEvent(host_, port_, authHeader(), "/Sessions/Playing", itemId, 0, false, ids);
 }
 
-bool JellyfinClient::reportPlaybackProgress(const std::string& itemId, int64_t positionTicks) {
+bool JellyfinClient::reportPlaybackProgress(const std::string& itemId, int64_t positionTicks,
+                                            const PlaybackIds& ids) {
     return postSessionEvent(host_, port_, authHeader(), "/Sessions/Playing/Progress", itemId,
-                             positionTicks, true);
+                             positionTicks, true, ids);
 }
 
-bool JellyfinClient::reportPlaybackStopped(const std::string& itemId, int64_t positionTicks) {
+bool JellyfinClient::reportPlaybackStopped(const std::string& itemId, int64_t positionTicks,
+                                           const PlaybackIds& ids) {
     return postSessionEvent(host_, port_, authHeader(), "/Sessions/Playing/Stopped", itemId,
-                             positionTicks, true);
+                             positionTicks, true, ids);
 }

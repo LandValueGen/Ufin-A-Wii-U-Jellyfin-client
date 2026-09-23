@@ -21,3 +21,4 @@ config.json
 *.swp
 .DS_Store
 tests/host/build/
+tools/glslcompiler.elf

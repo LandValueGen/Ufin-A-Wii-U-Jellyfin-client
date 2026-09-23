@@ -80,14 +80,10 @@ bool Decoder::open(AVIOContext* avioCtx) {
     fmt_ctx_->pb = avioCtx;
     fmt_ctx_->flags |= AVFMT_FLAG_CUSTOM_IO;
 
-    // Bound how much of the live stream avformat_find_stream_info() is
-    // allowed to swallow before we start playing. FFmpeg's defaults
-    // (5 MB / 5 seconds) matter here because for H.264 it keeps reading
-    // -- and decoding, through the hardware decoder -- until it has seen
-    // enough frames to guess the reorder delay, and a 2.5 Mbit/s
-    // transcode only produces those bytes in real time. One second of
-    // content is plenty for the fragmented MP4 Jellyfin sends, and turns
-    // a multi-second black screen at start into a short one.
+    // Bound how much of the live stream avformat_open_input() may read
+    // while probing the container format. A 2.5 Mbit/s transcode only
+    // produces bytes in real time, so a small limit keeps the black
+    // screen at start short.
     fmt_ctx_->probesize = 2 * 1024 * 1024;
     fmt_ctx_->max_analyze_duration = AV_TIME_BASE;
 
@@ -103,12 +99,18 @@ bool Decoder::open(AVIOContext* avioCtx) {
     }
     OSReport("Ufin: avformat_open_input ok (format=%s)\n", fmt_ctx_->iformat->name);
 
-    if (avformat_find_stream_info(fmt_ctx_, nullptr) < 0) {
-        snprintf(last_error_, sizeof(last_error_), "avformat_find_stream_info failed");
-        OSReport("Ufin: avformat_find_stream_info failed\n");
-        return false;
+    // NOT calling avformat_find_stream_info(): for H.264 it opens its own
+    // throwaway decoder (h264_wiiu, the only H.264 decoder in our build)
+    // and feeds it packets to guess the reorder delay -- and h264_wiiu
+    // crashes in that half-initialised probe context. The mov demuxer
+    // already fills in codec id, size, sample rate, channels and the
+    // avcC/esds extradata from the moov box during avformat_open_input,
+    // which is everything our own decoders need.
+    for (unsigned i = 0; i < fmt_ctx_->nb_streams; i++) {
+        AVCodecParameters* p = fmt_ctx_->streams[i]->codecpar;
+        OSReport("Ufin: stream %u codec=%d %dx%d rate=%d extradata=%d\n", i, p->codec_id,
+                 p->width, p->height, p->sample_rate, p->extradata_size);
     }
-    OSReport("Ufin: avformat_find_stream_info ok\n");
 
     video_stream_index_ = av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     audio_stream_index_ = av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);

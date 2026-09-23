@@ -18,7 +18,9 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 - ✅ Library browsing
 - ✅ Playback report to Jellyfin
 - ✅ Music playback
-- 🧪 Video playback (720p30 H.264 baseline + AAC, transcoded by the server; implemented, awaiting hardware testing)
+- 🧪 Video playback (720p30 H.264 baseline + AAC, transcoded by the server; plays in Cemu, awaiting hardware testing)
+- 🧪 Live TV (channel list with what's on now; tuned and transcoded by the server)
+- ✅ Jellyfin 10.8 through 12.x (uses the modern `Authorization` header and `ApiKey` query parameter)
 - ❌ Full player controls (Pause, shuffle, play queue and seek are yet to be added)
 - ❌ Wii U style UI
 
@@ -46,6 +48,17 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
    decoder; `main`/`high` are there for experiments).
 
 4. Insert the SD card into your Wii U and launch Ufin through your preferred homebrew method.
+
+## Controls
+
+| Button | Action |
+|---|---|
+| D-pad / left stick up-down | Move (hold to scroll fast) |
+| L / R, D-pad left-right | Page up / down |
+| A | Open folder / play |
+| B | Back; stops playback |
+| Y | Refresh the current list |
+| ZR | GX2 test picture (diagnostic) |
 
 ## SD Card Layout:
 
@@ -85,6 +98,37 @@ through the exact same GX2 path with no decoding involved.
 ## Development
 
 Built with WUT/devkitPro and tested on real Wii U hardware.
+
+### Building
+
+1. Install devkitPro with `wiiu-dev` and `wiiu-sdl2`. On Debian/Ubuntu/Mint
+   the installer must be fetched with `wget -U "dkp-apt" https://apt.devkitpro.org/install-devkitpro-pacman`
+   (the site's firewall blocks plain wget).
+2. Build [FFmpeg-wiiu](https://github.com/GaryOderNichts/FFmpeg-wiiu) **with
+   `patches/ffmpeg-wiiu-fixes.patch` applied** (`git apply` in the FFmpeg-wiiu
+   checkout). It fixes a heap overflow in `h264_wiiu` (framebuffer sized as
+   width*height*1.5 although the hardware writes a 256-pixel pitch and a
+   16-row aligned height), reads the packet from `avpkt->data` instead of
+   `avpkt->buf`, checks its allocations, and adds `--disable-network`
+   (current wut ships its own `inet_aton`, which clashes with FFmpeg's).
+   Then, with `DEVKITPRO`, `DEVKITPPC` and `WUT_ROOT=$DEVKITPRO/wut` set:
+   `./configure-wiiu && make -j$(nproc) && sudo -E make install`.
+3. Put `glslcompiler.elf` from [CafeGLSL](https://github.com/Exzap/CafeGLSL/releases)
+   in `tools/`, then `mkdir build && cd build && cmake .. && make`.
+
+### Testing in Cemu
+
+Cemu maps `sd:/` to its `sdcard` folder (`~/.local/share/Cemu/sdcard` for the
+Linux AppImage), so put `config.json` in `sdcard/wiiu/apps/ufin/`. Set up an
+emulated **Wii U GamePad** in Options -> Input settings. `127.0.0.1` works as
+the host when Jellyfin runs on the same PC (on a real Wii U it must be the
+PC's LAN address). The log with all `Ufin:` lines is Cemu's `log.txt`; on
+start-up it reports the measured text grid of both screens.
+
+Cemu draws OSScreen text on a different grid than the menus were first laid
+out for (16x24 glyphs from the screen edge), which made long lines wrap back
+over themselves and the selection band sit a row off. The UI now measures
+the grid at start-up instead of assuming it, so both look right.
 
 Everything that doesn't touch the Wii U hardware also has host-side tests
 (plain `g++`, no devkitPro needed): the menu screens, the Jellyfin client and

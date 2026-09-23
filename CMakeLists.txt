@@ -24,9 +24,11 @@ link_directories("$ENV{DEVKITPRO}/portlibs/wiiu/lib")
 
 add_executable(ufin
     src/main.cpp
+    src/config_loader.cpp
     src/http_client.cpp
     src/http_stream_reader.cpp
     src/jellyfin_client.cpp
+    src/item_labels.cpp
     src/vendor/cJSON.c
     src/media/http_stream_io.cpp
     src/media/decoder.cpp
