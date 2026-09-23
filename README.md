@@ -11,6 +11,8 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 
 **Very early development.** Expect bugs, crashes, and probably the occasional Wii U death beep.
 
+**v0.2.0 with video support still to be released, source is updated tho**
+
 ## Current status
 
 - ✅ Wii U ↔ Jellyfin connection
@@ -18,7 +20,7 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 - ✅ Library browsing
 - ✅ Playback report to Jellyfin
 - ✅ Music playback
-- 🧪 Video playback (720p30 H.264 baseline + AAC, transcoded by the server; plays in Cemu, Real Hardware only plays a frame when stopping playback, could be due to my console having bad WiFi)
+- 🧪 Video playback (720p30 H.264 baseline + AAC, transcoded by the server; plays in Cemu, Real Hardware only plays a frame when stopping playback, seems to be an issue with how a real console handles the gx2 shader)
 - 🧪 Live TV (channel list with what's on now; tuned and transcoded by the server)
 - ✅ Jellyfin 10.8 through 12.x (uses the modern `Authorization` header and `ApiKey` query parameter)
 - ❌ Full player controls (Pause, shuffle, play queue and seek are yet to be added)
