@@ -76,6 +76,29 @@ int main() {
     }
     CHECK_NEAR(audio.clockSeconds(), 10.5, 0.15);
 
+    // Pause: device paused, clock frozen however long the pause lasts,
+    // queueing more audio doesn't move it; resume carries on from there.
+    {
+        double before = audio.clockSeconds();
+        audio.setPaused(true);
+        CHECK(audio.paused());
+        CHECK(fake_sdl_device_paused());
+        fake_sdl_advance_ticks(3000);
+        CHECK_NEAR(audio.clockSeconds(), before, 1e-6);
+        AVFrame* f = makeAudioFrame(1024, 48000);
+        audio.queueFrame(f, pts);
+        av_frame_free(&f);
+        pts += 1024.0 / 48000.0;
+        CHECK_NEAR(audio.clockSeconds(), before, 1e-6);
+        audio.setPaused(false);
+        CHECK(!audio.paused());
+        CHECK(!fake_sdl_device_paused());
+        fake_sdl_advance_ticks(250);
+        CHECK_NEAR(audio.clockSeconds(), before + 0.25, 0.01);
+        audio.setPaused(false); // no-op
+        CHECK_NEAR(audio.clockSeconds(), before + 0.25, 0.01);
+    }
+
     // Resampling: a 44.1 kHz source produces ~48/44.1 as many output samples.
     {
         AudioOutput resampled;

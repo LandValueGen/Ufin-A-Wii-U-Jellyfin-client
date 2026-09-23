@@ -1,4 +1,5 @@
 #include "player.h"
+#include "../seek.h"
 #include "http_stream_io.h"
 #include "decoder.h"
 #include "video_output.h"
@@ -23,15 +24,22 @@ static const double LATE_FRAME_DROP_SECONDS = 0.20;
 // video, indirectly bounds how far ahead video decoding gets too.
 static const double MAX_AUDIO_AHEAD_SECONDS = 1.5;
 
+// Cap on compressed packets read ahead of decoding (see the decode
+// thread). At 2.5 Mbit/s this is over a minute of stream -- far more
+// than one fragment -- and still a small slice of MEM2.
+static const size_t MAX_BUFFERED_PACKET_BYTES = 24 * 1024 * 1024;
+
 static double nowSeconds() {
     return SDL_GetTicks() / 1000.0;
 }
 
 PlayResult Player::play(const std::string& host, int port, const std::string& path,
-                         const std::function<bool()>& shouldStop,
+                         const std::function<PlayerCommand()>& poll,
                          const std::function<void(double)>& onTick,
                          const PlayOptions& options) {
-    last_position_ = 0.0;
+    last_position_ = options.startOffsetSeconds;
+    paused_ = false;
+    seek_target_ = 0.0;
 
     HttpStreamIO io(host, port, path);
     if (!io.open()) {
@@ -94,29 +102,46 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
     std::atomic<bool> decodeDone{false};
 
     std::thread decodeThread([&]() {
+        // Demuxing and decoding are separate steps (see the per-stream
+        // API in decoder.h): Jellyfin's fragmented MP4 arrives as seconds
+        // of video followed by the same seconds of audio, so each stream
+        // is decoded from its own packet queue, only when it needs a
+        // frame, and the network is read whenever the stream that needs
+        // one has no packets buffered.
         while (!stopRequested) {
+            bool progressed = false;
             AVFrame* frame = nullptr;
-            DecodedFrameType type = decoder.decodeNextFrame(&frame);
 
-            if (type == DecodedFrameType::NONE) {
-                break;
-            } else if (type == DecodedFrameType::AUDIO && hasAudio) {
-                double pts = decoder.frameTimeSeconds(type, frame);
-                if (hasVideo) {
-                    // Don't let audio (and therefore the whole decode)
-                    // run unboundedly ahead of playback.
-                    while (!stopRequested && audio.queuedSeconds() > MAX_AUDIO_AHEAD_SECONDS) {
-                        SDL_Delay(5);
-                    }
-                    if (stopRequested) break;
-                }
-                audio.queueFrame(frame, pts);
-            } else if (type == DecodedFrameType::VIDEO && hasVideo) {
-                double pts = decoder.frameTimeSeconds(type, frame);
+            const bool audioWanted = hasAudio &&
+                (!hasVideo || audio.queuedSeconds() < MAX_AUDIO_AHEAD_SECONDS);
+            const bool videoWanted = hasVideo && videoQueue.size() < FrameQueue::MAX_SIZE;
+
+            if (audioWanted && decoder.decodeAudioFrame(&frame) == DecodedFrameType::AUDIO) {
+                audio.queueFrame(frame, decoder.frameTimeSeconds(DecodedFrameType::AUDIO, frame));
+                progressed = true;
+            }
+            if (videoWanted && decoder.decodeVideoFrame(&frame) == DecodedFrameType::VIDEO) {
+                double pts = decoder.frameTimeSeconds(DecodedFrameType::VIDEO, frame);
                 AVFrame* clone = av_frame_clone(frame);
-                if (clone) {
-                    videoQueue.push(clone, pts);
-                }
+                // Only this thread pushes and there was room, so this
+                // never blocks.
+                if (clone) videoQueue.push(clone, pts);
+                progressed = true;
+            }
+            if (progressed) continue;
+
+            if (decoder.finished()) break;
+
+            const bool starved = (audioWanted && !decoder.hasQueuedAudioPackets()) ||
+                                 (videoWanted && !decoder.hasQueuedVideoPackets());
+            if (starved && !decoder.demuxFinished() &&
+                decoder.queuedPacketBytes() < MAX_BUFFERED_PACKET_BYTES) {
+                decoder.readPacket(); // blocks on the network
+            } else {
+                // Outputs full (wait for playback to catch up), or the
+                // read-ahead cap was hit, or at end of input waiting for
+                // room to hand out the last frames.
+                SDL_Delay(5);
             }
         }
         decodeDone = true;
@@ -145,27 +170,62 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
     const double loopStartTime = nowSeconds();
     double lastTickTime = loopStartTime;
 
+    double firstStreamTime = NAN;  // first clock value seen, for itemPositionFromStreamTime
+    double pauseStartedAt = NAN;   // wall time the current pause began (video-only clock)
+
     while (true) {
-        if (shouldStop()) {
+        PlayerCommand cmd = poll();
+        if (cmd.kind == PlayerCommand::Kind::Stop) {
             stopRequested = true;
             videoQueue.stop();
             result = PlayResult::Stopped;
             break;
         }
+        if (cmd.kind == PlayerCommand::Kind::SeekTo) {
+            seek_target_ = cmd.seconds < 0.0 ? 0.0 : cmd.seconds;
+            OSReport("Ufin: seek requested to %.1fs\n", seek_target_);
+            stopRequested = true;
+            videoQueue.stop();
+            result = PlayResult::SeekRequested;
+            break;
+        }
+        if (cmd.kind == PlayerCommand::Kind::TogglePause) {
+            paused_ = !paused_;
+            OSReport("Ufin: %s at %.1fs\n", paused_ ? "paused" : "resumed", last_position_);
+            if (hasAudio) audio.setPaused(paused_);
+            if (paused_) {
+                pauseStartedAt = nowSeconds();
+            } else if (!std::isnan(pauseStartedAt)) {
+                // Video-only wall clock: don't count the pause as played time.
+                if (!std::isnan(wallClockBase)) wallClockBase += nowSeconds() - pauseStartedAt;
+                pauseStartedAt = NAN;
+            }
+        }
 
         double now = nowSeconds();
-        {
-            double pos = masterClock();
-            if (!std::isnan(pos)) last_position_ = pos;
+        if (!paused_) {
+            double clock = masterClock();
+            if (!std::isnan(clock)) {
+                if (std::isnan(firstStreamTime)) firstStreamTime = clock;
+                last_position_ = itemPositionFromStreamTime(clock, options.startOffsetSeconds, firstStreamTime);
+            }
         }
         if (onTick && now - lastTickTime >= 1.0) {
             onTick(last_position_);
             lastTickTime = now;
             if (hasVideo) {
-                OSReport("Ufin: pos=%.1fs rendered=%d dropped=%d queued=%u audio=%.2fs\n",
+                OSReport("Ufin: pos=%.1fs rendered=%d dropped=%d queued=%u audio=%.2fs%s\n",
                          last_position_, framesRendered, framesDropped,
-                         (unsigned)videoQueue.size(), hasAudio ? audio.queuedSeconds() : 0.0);
+                         (unsigned)videoQueue.size(), hasAudio ? audio.queuedSeconds() : 0.0,
+                         paused_ ? " (paused)" : "");
             }
+        }
+
+        if (paused_) {
+            // Hold the current picture; the decode thread fills its
+            // buffers and then stops reading on its own.
+            SDL_Delay(15);
+            continue;
         }
 
         if (!hasVideo) {
@@ -202,7 +262,7 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
                     }
                     SDL_Delay(16);
                 }
-                continue; // timeout: loop back to poll shouldStop()
+                continue; // timeout: loop back to poll()
             }
             haveHeld = true;
         }
@@ -226,7 +286,7 @@ PlayResult Player::play(const std::string& host, int port, const std::string& pa
         if (!audioNotStartedYet && !std::isnan(clock)) {
             double delay = pts - clock;
             if (delay > 0.005) {
-                // Not time yet. Sleep in short slices so shouldStop()
+                // Not time yet. Sleep in short slices so poll()
                 // stays responsive even if the timestamps jump.
                 SDL_Delay((Uint32)std::min(delay * 1000.0, 15.0));
                 continue;

@@ -23,18 +23,20 @@
 #include "jellyfin_client.h"
 #include "config_loader.h"
 #include "item_labels.h"
+#include "seek.h"
 #include "media/player.h"
 #include "media/video_output.h"
 #include "ui/screens.h"
 #include "ui/os_screen_display.h"
+#include "ui/keyboard.h"
 
 // One level of browsing. The whole path is kept on a stack with each
 // level's list and selection, so B goes back instantly to exactly where
 // you were instead of re-fetching (and losing your place).
 struct Frame {
-    enum class Kind { Views, Items, LiveTv };
+    enum class Kind { Views, Items, LiveTv, Search };
     Kind kind = Kind::Views;
-    std::string id;     // parent id for Items, empty otherwise
+    std::string id;     // parent id for Items, the search term for Search
     std::string title;  // shown in the breadcrumb
     std::vector<JellyfinItem> items;
     int selected = 0;
@@ -82,9 +84,10 @@ static void renderList(const std::vector<Frame>& stack) {
     model.title = "Ufin";
     model.location = breadcrumb(stack);
     model.selectedIndex = f.selected;
-    model.footer = stack.size() > 1 ? "A: open    B: back    L/R: page    Y: refresh"
-                                    : "A: open    L/R: page    Y: refresh";
+    model.footer = stack.size() > 1 ? "A: open   B: back   X: search   L/R: page   Y: refresh"
+                                    : "A: open   X: search   L/R: page   Y: refresh";
     if (f.kind == Frame::Kind::LiveTv) model.emptyMessage = "No channels. Set up a tuner in Jellyfin.";
+    if (f.kind == Frame::Kind::Search) model.emptyMessage = "No results for \"" + f.id + "\".";
     model.items.reserve(f.items.size());
     for (const JellyfinItem& item : f.items) {
         ui::ListEntry e;
@@ -103,21 +106,57 @@ static bool loadFrame(JellyfinClient& client, Frame& f) {
         case Frame::Kind::Views:  ok = client.getViews(f.items); break;
         case Frame::Kind::Items:  ok = client.getItems(f.id, f.items); break;
         case Frame::Kind::LiveTv: ok = client.getLiveTvChannels(f.items); break;
+        case Frame::Kind::Search: ok = client.search(f.id, f.items); break;
     }
     if (f.selected >= (int)f.items.size()) f.selected = (int)f.items.size() - 1;
     if (f.selected < 0) f.selected = 0;
     return ok;
 }
 
-// Polled by Player many times a second. Also keeps ProcUI serviced --
-// pressing HOME mid-playback otherwise leaves the system waiting on us.
-static bool stopRequestedByUser() {
-    if (!WHBProcIsRunning()) return true;
-    VPADStatus playbackVpad;
-    VPADReadError playbackErr;
-    VPADRead(VPAD_CHAN_0, &playbackVpad, 1, &playbackErr);
-    return (playbackErr == VPAD_READ_SUCCESS) && (playbackVpad.trigger & VPAD_BUTTON_B);
-}
+// Reads the GamePad for Player many times a second (which also keeps
+// ProcUI serviced -- pressing HOME mid-playback otherwise leaves the
+// system waiting on us) and turns presses into PlayerCommands:
+//   B: stop    A: pause/resume    Left: -10 s    Right: +30 s
+// Skips are collected for a moment before seeking, so pressing Right
+// three times makes one +90 s restart of the transcode, not three.
+struct PlaybackControl {
+    static const int SKIP_BACK_SECONDS = 10;
+    static const int SKIP_FORWARD_SECONDS = 30;
+    static const int SEEK_COMMIT_MS = 600;
+
+    bool canSeekAndPause = true;  // false for Live TV
+    double durationSeconds = 0.0; // 0 = unknown (no upper clamp)
+    const Player* player = nullptr;
+
+    double pendingDelta = 0.0;
+    OSTime lastSkipPress = 0;
+
+    PlayerCommand poll() {
+        if (!WHBProcIsRunning()) return PlayerCommand::stop();
+        VPADStatus vpad;
+        VPADReadError err;
+        VPADRead(VPAD_CHAN_0, &vpad, 1, &err);
+        if (err == VPAD_READ_SUCCESS) {
+            if (vpad.trigger & VPAD_BUTTON_B) return PlayerCommand::stop();
+            if (canSeekAndPause) {
+                if (vpad.trigger & VPAD_BUTTON_A) return PlayerCommand::togglePause();
+                if (vpad.trigger & (VPAD_BUTTON_LEFT | VPAD_STICK_L_EMULATION_LEFT)) {
+                    pendingDelta -= SKIP_BACK_SECONDS;
+                    lastSkipPress = OSGetTime();
+                } else if (vpad.trigger & (VPAD_BUTTON_RIGHT | VPAD_STICK_L_EMULATION_RIGHT)) {
+                    pendingDelta += SKIP_FORWARD_SECONDS;
+                    lastSkipPress = OSGetTime();
+                }
+            }
+        }
+        if (pendingDelta != 0.0 && OSTicksToMilliseconds(OSGetTime() - lastSkipPress) >= SEEK_COMMIT_MS) {
+            double target = clampSeek(player ? player->positionSeconds() : 0.0, pendingDelta, durationSeconds);
+            pendingDelta = 0.0;
+            return PlayerCommand::seekTo(target);
+        }
+        return PlayerCommand::none();
+    }
+};
 
 // Diagnostic: draws a flat magenta picture via the exact same
 // shader/upload/present pipeline as real video, with no decode or
@@ -165,9 +204,10 @@ public:
         thread_.join();
     }
 
-    void update(double positionSeconds) {
+    void update(double positionSeconds, bool paused) {
         std::lock_guard<std::mutex> lock(mutex_);
         position_ = positionSeconds;
+        paused_ = paused;
     }
 
 private:
@@ -177,8 +217,9 @@ private:
             wake_.wait_for(lock, std::chrono::seconds(10), [this] { return stop_; });
             if (stop_) break;
             int64_t ticks = (int64_t)(position_ * 10000000.0);
+            bool paused = paused_;
             lock.unlock();
-            client_.reportPlaybackProgress(itemId_, ticks, ids_);
+            client_.reportPlaybackProgress(itemId_, ticks, ids_, paused);
             lock.lock();
         }
     }
@@ -187,6 +228,7 @@ private:
     std::string itemId_;
     PlaybackIds ids_;
     double position_ = 0.0; // guarded by mutex_ (a 64-bit atomic would need libatomic on PPC)
+    bool paused_ = false;
     std::mutex mutex_;
     std::condition_variable wake_;
     bool stop_ = false;
@@ -212,7 +254,10 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
     showMessage(isLive ? "Ufin  |  Tuning" : "Ufin  |  Loading",
                 {itemDisplayName(picked), "",
                  isLive ? "Asking the server to tune the channel and start the transcode..."
-                        : "Waiting for the server to start streaming..."},
+                        : "Waiting for the server to start streaming...",
+                 "",
+                 isLive ? "During playback: B stops."
+                        : "During playback: A pauses, Left/Right skip back 10 s / forward 30 s, B stops."},
                 "Please wait");
 
     if (isLive) {
@@ -245,10 +290,6 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
     ids.liveStreamId = videoOptions.liveStreamId;
     ids.playSessionId = videoOptions.playSessionId;
 
-    StreamTarget target = isAudio
-        ? client.buildAudioStreamUrl(picked.id)
-        : client.buildVideoStreamUrl(picked.id, videoOptions);
-
     if (!isAudio) {
         // OSScreen and GX2 both drive the same display hardware; both
         // active at once caused a hard OSFatal hang on Cemu and real
@@ -261,29 +302,48 @@ static PlayResult playItem(JellyfinClient& client, const UfinConfig& cfg, const 
     client.reportPlaybackStart(picked.id, ids);
 
     Player player;
+    PlaybackControl control;
+    control.canSeekAndPause = !isLive;
+    control.durationSeconds = durationSeconds;
+    control.player = &player;
+
     PlayResult result;
+    double startAt = 0.0;
     {
     ProgressReporter reporter(client, picked.id, ids);
-    result = player.play(target.host, target.port, target.path,
-        stopRequestedByUser,
-        [&](double positionSeconds) {
-            // Roughly once per second with the real playback position
-            // (from the audio clock), on the render loop -- so nothing
-            // slow here. The reporter thread tells Jellyfin; for audio,
-            // redraw Now Playing.
-            reporter.update(positionSeconds);
+    while (true) {
+        // Seeking restarts the transcode at the new position: the stream
+        // itself can't be seeked, but Jellyfin starts one anywhere.
+        videoOptions.startTimeTicks = (int64_t)(startAt * 10000000.0);
+        StreamTarget target = isAudio
+            ? client.buildAudioStreamUrl(picked.id, videoOptions.startTimeTicks)
+            : client.buildVideoStreamUrl(picked.id, videoOptions);
+        playOptions.startOffsetSeconds = startAt;
 
-            if (isAudio) {
-                ui::NowPlayingModel model;
-                model.title = itemDisplayName(picked);
-                model.subtitle = "Audio  |  AAC transcode";
-                model.positionSeconds = positionSeconds;
-                model.durationSeconds = durationSeconds;
-                model.footer = "B: stop";
-                display.render([&](ui::Surface& s) { ui::drawNowPlayingScreen(s, model); });
-            }
-        },
-        playOptions);
+        result = player.play(target.host, target.port, target.path,
+            [&]() { return control.poll(); },
+            [&](double positionSeconds) {
+                // Roughly once per second, on the render loop -- so
+                // nothing slow here. The reporter thread tells Jellyfin;
+                // for audio, redraw Now Playing.
+                reporter.update(positionSeconds, player.isPaused());
+
+                if (isAudio) {
+                    ui::NowPlayingModel model;
+                    model.title = itemDisplayName(picked);
+                    model.subtitle = player.isPaused() ? "Paused" : "Audio  |  AAC transcode";
+                    model.positionSeconds = positionSeconds;
+                    model.durationSeconds = durationSeconds;
+                    model.footer = "A: pause   Left/Right: -10 s / +30 s   B: stop";
+                    display.render([&](ui::Surface& s) { ui::drawNowPlayingScreen(s, model); });
+                }
+            },
+            playOptions);
+
+        if (result != PlayResult::SeekRequested) break;
+        startAt = player.seekTarget();
+        reporter.update(startAt, false);
+    }
     } // reporter stops here, before the final report
 
     client.reportPlaybackStopped(picked.id, (int64_t)(player.positionSeconds() * 10000000.0), ids);
@@ -414,6 +474,28 @@ int main(int argc, char** argv) {
                 changed = true;
             } else if ((pressed & BTN_PAGE_UP) && count > 0) {
                 f.selected = std::max(f.selected - page, 0);
+                changed = true;
+            } else if (pressed & VPAD_BUTTON_X) {
+                // Search. swkbd draws with GX2, so OSScreen steps aside
+                // like it does for video.
+                display.shutdown();
+                std::string term, keyboardError;
+                bool entered = ui::promptKeyboard(u"Search movies, shows and music", term, keyboardError);
+                display.init();
+                if (entered) {
+                    Frame results;
+                    results.kind = Frame::Kind::Search;
+                    results.id = term;
+                    results.title = "Search: " + term;
+                    showMessage("Ufin", {"Searching for \"" + term + "\" ..."}, "Please wait");
+                    if (loadFrame(client, results)) {
+                        stack.push_back(results);
+                    } else {
+                        errorMessage = client.lastError();
+                    }
+                } else if (!keyboardError.empty()) {
+                    errorMessage = "Keyboard: " + keyboardError;
+                }
                 changed = true;
             } else if (pressed & VPAD_BUTTON_Y) {
                 showMessage("Ufin", {"Refreshing..."}, "Please wait");

@@ -57,8 +57,14 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 | L / R, D-pad left-right | Page up / down |
 | A | Open folder / play |
 | B | Back; stops playback |
+| X | Search (Wii U on-screen keyboard) |
 | Y | Refresh the current list |
 | ZR | GX2 test picture (diagnostic) |
+
+During playback: **A** pause / resume, **Left** back 10 s, **Right** forward 30 s
+(presses add up: Right three times = +90 s), **B** stop. Live TV only has B.
+Skipping restarts the server's transcode at the new position, so it takes a
+moment, like starting playback.
 
 ## SD Card Layout:
 

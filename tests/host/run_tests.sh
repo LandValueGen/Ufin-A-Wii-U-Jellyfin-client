@@ -43,6 +43,7 @@ RUN_ARGS=""
 run test_ui        "$HERE/test_ui.cpp" "$SRC/ui/screens.cpp"
 run test_config    "$HERE/test_config.cpp" "$SRC/config_loader.cpp" "$SRC/vendor/cJSON.c"
 run test_jellyfin  "$HERE/test_jellyfin.cpp" "$SRC/jellyfin_client.cpp" "$SRC/http_client.cpp" "$SRC/vendor/cJSON.c"
+run test_playback_controls "$HERE/test_playback_controls.cpp"
 run test_grid_probe "$HERE/test_grid_probe.cpp"
 run test_item_labels "$HERE/test_item_labels.cpp" "$SRC/item_labels.cpp" "$SRC/ui/screens.cpp"
 
@@ -64,6 +65,18 @@ if [ -n "${FFMPEG_HOST:-}" ] && [ -d "$FFMPEG_HOST/include/libavcodec" ]; then
             run test_decoder_stream "$HERE/test_decoder_stream.cpp" "$SRC/media/decoder.cpp" \
                 "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp"
             RUN_ARGS=""
+            LONG="$OUT/sample_long_frag.mp4"
+            # 5 s fragments, like Jellyfin's: video run, then audio run.
+            if ffmpeg -v error -y -f lavfi -i "testsrc2=size=320x240:rate=30" \
+                      -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 12 \
+                      -c:v libx264 -profile:v baseline -pix_fmt yuv420p -g 150 \
+                      -c:a aac -b:a 128k -ac 2 \
+                      -movflags frag_keyframe+empty_moov+delay_moov "$LONG" 2>>"$OUT/ffmpeg.log"; then
+                RUN_ARGS="$LONG"
+                run test_playback_schedule "$HERE/test_playback_schedule.cpp" "$SRC/media/decoder.cpp" \
+                    "$SRC/media/http_stream_io.cpp" "$SRC/http_stream_reader.cpp"
+                RUN_ARGS=""
+            fi
         else
             echo "== test_decoder_stream: SKIPPED (ffmpeg could not create the sample clip; see $OUT/ffmpeg.log)"
         fi

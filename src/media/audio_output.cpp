@@ -61,7 +61,29 @@ void AudioOutput::start() {
     std::lock_guard<std::mutex> lock(clock_mtx_);
     started_ = true;
     clock_wall_ms_ = SDL_GetTicks();
-    SDL_PauseAudioDevice(device_, 0); // unpause
+    if (!paused_) SDL_PauseAudioDevice(device_, 0); // unpause
+}
+
+void AudioOutput::setPaused(bool paused) {
+    if (device_ == 0) return;
+    std::lock_guard<std::mutex> lock(clock_mtx_);
+    if (paused == paused_) return;
+    uint32_t nowMs = SDL_GetTicks();
+    if (paused) {
+        // Freeze the clock where playback is right now.
+        if (started_ && clock_valid_) clock_pts_ += (nowMs - clock_wall_ms_) / 1000.0;
+        paused_ = true;
+        SDL_PauseAudioDevice(device_, 1);
+    } else {
+        paused_ = false;
+        clock_wall_ms_ = nowMs; // extrapolate from here, not from before the pause
+        if (started_) SDL_PauseAudioDevice(device_, 0);
+    }
+}
+
+bool AudioOutput::paused() const {
+    std::lock_guard<std::mutex> lock(clock_mtx_);
+    return paused_;
 }
 
 void AudioOutput::queueFrame(AVFrame* frame, double ptsSeconds) {
@@ -102,6 +124,12 @@ void AudioOutput::queueFrame(AVFrame* frame, double ptsSeconds) {
 
     uint32_t nowMs = SDL_GetTicks();
     std::lock_guard<std::mutex> lock(clock_mtx_);
+    if (paused_) {
+        // Nothing is being played, so the queue says nothing new about
+        // where playback is; keep the frozen clock.
+        if (!clock_valid_) { clock_pts_ = ptsSeconds; clock_valid_ = true; }
+        return;
+    }
     if (!started_ || !clock_valid_) {
         // Not playing yet: the clock sits at the first frame's start
         // time until start() lets playback begin.
@@ -143,7 +171,7 @@ bool AudioOutput::hasClock() const {
 double AudioOutput::clockSeconds() const {
     std::lock_guard<std::mutex> lock(clock_mtx_);
     if (!clock_valid_) return NAN;
-    if (!started_) return clock_pts_;
+    if (!started_ || paused_) return clock_pts_;
     return clock_pts_ + (SDL_GetTicks() - clock_wall_ms_) / 1000.0;
 }
 
@@ -153,5 +181,6 @@ void AudioOutput::shutdown() {
     if (device_ != 0) { SDL_CloseAudioDevice(device_); device_ = 0; }
     started_ = false;
     clock_valid_ = false;
+    paused_ = false;
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
 }

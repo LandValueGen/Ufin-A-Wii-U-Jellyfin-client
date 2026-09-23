@@ -287,6 +287,43 @@ int main() {
     }
     CHECK(client.closeLiveStream(""));
 
+    // Search: recursive, URL-encoded term, series name kept.
+    {
+        FakeRoute results;
+        results.body = "{\"Items\":[{\"Id\":\"e9\",\"Name\":\"Pilot\",\"Type\":\"Episode\",\"SeriesName\":\"Lost\"}]}";
+        server.addRoute("/Users/user1/Items", results);
+        CHECK(client.search("citt\xc3\xa0 & co", list));
+        CHECK_EQ((int)list.size(), 1);
+        CHECK_STR(list[0].seriesName, "Lost");
+        auto reqs = server.requests();
+        CHECK(contains(reqs.back().path, "SearchTerm=citt%C3%A0%20%26%20co"));
+        CHECK(contains(reqs.back().path, "Recursive=true"));
+    }
+
+    // Seeking restarts the transcode at StartTimeTicks.
+    {
+        VideoStreamOptions o;
+        o.startTimeTicks = 6000000000LL; // 10 min
+        CHECK(contains(client.buildVideoStreamUrl("m1", o).path, "&StartTimeTicks=6000000000"));
+        CHECK(!contains(client.buildVideoStreamUrl("m1").path, "StartTimeTicks"));
+        CHECK(contains(client.buildAudioStreamUrl("a1", 1234).path, "&StartTimeTicks=1234"));
+        CHECK(!contains(client.buildAudioStreamUrl("a1").path, "StartTimeTicks"));
+    }
+
+    // Progress carries IsPaused; CanSeek is true except for Live TV.
+    {
+        CHECK(client.reportPlaybackProgress("m1", 10, PlaybackIds(), true));
+        auto reqs = server.requests();
+        CHECK(contains(reqs.back().body, "\"IsPaused\":true"));
+        CHECK(contains(reqs.back().body, "\"CanSeek\":true"));
+        PlaybackIds liveIds;
+        liveIds.liveStreamId = "ls";
+        CHECK(client.reportPlaybackProgress("ch1", 10, liveIds));
+        reqs = server.requests();
+        CHECK(contains(reqs.back().body, "\"IsPaused\":false"));
+        CHECK(contains(reqs.back().body, "\"CanSeek\":false"));
+    }
+
     server.stop();
     return check::finish("test_jellyfin");
 }

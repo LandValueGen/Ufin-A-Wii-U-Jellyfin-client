@@ -14,6 +14,7 @@ struct JellyfinItem {
     int productionYear = 0;     // 0 if not provided
     std::string channelNumber;  // TvChannel only, e.g. "5" or "5.1"
     std::string currentProgram; // TvChannel only: what's on right now, if the guide knows
+    std::string seriesName;     // Episode / Season: the show it belongs to
 };
 
 // Everything needed to make HTTP requests against a media stream:
@@ -39,6 +40,10 @@ struct VideoStreamOptions {
     std::string mediaSourceId;
     std::string liveStreamId;
     std::string playSessionId;
+
+    // Where to start, in Jellyfin ticks (100 ns). Seeking restarts the
+    // transcode here -- the stream itself can't be seeked.
+    int64_t startTimeTicks = 0;
 };
 
 // What we need to know about a video before playing it -- fetched from
@@ -89,6 +94,9 @@ public:
     // browsing it via getItems() doesn't return channels.
     bool getLiveTvChannels(std::vector<JellyfinItem>& out);
 
+    // Library-wide search by name (movies, shows, episodes, music).
+    bool search(const std::string& term, std::vector<JellyfinItem>& out);
+
     // Fetches the item's metadata to learn its real aspect ratio and
     // duration. Returns false (with lastError() set) if the request
     // fails; fields that couldn't be determined stay at their zero
@@ -109,7 +117,7 @@ public:
     // (Jellyfin's /Audio/ endpoint rather than /Videos/). Forces AAC in
     // MP4 so it matches the decoder + demuxer our FFmpeg build actually
     // has.
-    StreamTarget buildAudioStreamUrl(const std::string& itemId) const;
+    StreamTarget buildAudioStreamUrl(const std::string& itemId, int64_t startTimeTicks = 0) const;
 
     // Builds a request target for streaming a video item (or an opened
     // Live TV channel), forcing a server-side transcode to H.264 + AAC
@@ -126,7 +134,7 @@ public:
     // 10,000,000 per second).
     bool reportPlaybackStart(const std::string& itemId, const PlaybackIds& ids = PlaybackIds());
     bool reportPlaybackProgress(const std::string& itemId, int64_t positionTicks,
-                                const PlaybackIds& ids = PlaybackIds());
+                                const PlaybackIds& ids = PlaybackIds(), bool isPaused = false);
     bool reportPlaybackStopped(const std::string& itemId, int64_t positionTicks,
                                const PlaybackIds& ids = PlaybackIds());
 

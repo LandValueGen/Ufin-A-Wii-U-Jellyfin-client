@@ -43,6 +43,12 @@ public:
     void start();
     bool started() const { return started_; }
 
+    // Pauses/resumes the device. While paused the clock holds still (so
+    // video holds its frame) and SDL stops consuming, which in turn
+    // stops the decode thread once it's far enough ahead.
+    void setPaused(bool paused);
+    bool paused() const;
+
     // How much queued audio SDL hasn't played yet -- in bytes at the
     // output format, or in seconds. Used by Player to keep the decode
     // thread from running unboundedly ahead of playback.
@@ -79,6 +85,7 @@ private:
     // clock_wall_ms_"; extrapolated with wall time in between updates.
     mutable std::mutex clock_mtx_;
     bool clock_valid_ = false;
+    bool paused_ = false;
     double clock_pts_ = 0.0;
     uint32_t clock_wall_ms_ = 0;
 

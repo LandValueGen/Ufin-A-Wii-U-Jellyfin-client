@@ -137,90 +137,124 @@ bool Decoder::open(AVIOContext* avioCtx) {
     return true;
 }
 
-DecodedFrameType Decoder::decodeNextFrame(AVFrame** outFrame) {
+bool Decoder::readPacket() {
+    if (reachedEof_ || !fmt_ctx_) return false;
     while (true) {
-        // First, see if either open codec already has a decoded frame
-        // sitting ready (can happen because one input packet sometimes
-        // yields multiple output frames, or during end-of-stream flush).
-        if (video_ctx_) {
-            int ret = avcodec_receive_frame(video_ctx_, frame_);
-            if (ret == 0) {
-                *outFrame = frame_;
-                return DecodedFrameType::VIDEO;
-            }
-            // AVERROR(EAGAIN) just means "no frame yet, feed me more
-            // packets" -- not an error, fall through to read more.
-            // AVERROR_EOF means this stream is fully drained. Anything
-            // else is a genuine decode error for one packet (h264_wiiu
-            // reports hardware decoder failures this way); the packet
-            // has already been consumed, so just log it and move on.
-            if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
-                video_decode_errors_++;
-                if (video_decode_errors_ <= 5 || video_decode_errors_ % 100 == 0) {
-                    OSReport("Ufin: video decode error %d (count=%d)\n", ret, video_decode_errors_);
-                }
-            }
+        int readRet = av_read_frame(fmt_ctx_, packet_);
+        if (readRet < 0) {
+            // End of stream (or a network error we can't distinguish
+            // from EOF here). Decoders are flushed once their queues
+            // drain, so buffered packets still get decoded.
+            OSReport("Ufin: av_read_frame returned %d -- treating as end of stream\n", readRet);
+            reachedEof_ = true;
+            return false;
         }
-        if (audio_ctx_) {
-            int ret = avcodec_receive_frame(audio_ctx_, frame_);
-            if (ret == 0) {
-                *outFrame = frame_;
-                return DecodedFrameType::AUDIO;
+        std::deque<AVPacket*>* queue = nullptr;
+        if (packet_->stream_index == video_stream_index_ && video_ctx_) queue = &video_packets_;
+        else if (packet_->stream_index == audio_stream_index_ && audio_ctx_) queue = &audio_packets_;
+        if (!queue) {
+            // e.g. a subtitle track we never opened a codec for
+            av_packet_unref(packet_);
+            continue;
+        }
+        AVPacket* copy = av_packet_alloc();
+        if (!copy) {
+            av_packet_unref(packet_);
+            continue;
+        }
+        av_packet_move_ref(copy, packet_);
+        queued_packet_bytes_ += (size_t)copy->size;
+        queue->push_back(copy);
+        return true;
+    }
+}
+
+bool Decoder::decodeFrom(AVCodecContext* ctx, std::deque<AVPacket*>& queue, bool& flushed,
+                         bool& drained, bool isVideo, AVFrame** outFrame) {
+    if (!ctx || drained) return false;
+    for (int guard = 0; guard < 64; guard++) {
+        int ret = avcodec_receive_frame(ctx, frame_);
+        if (ret == 0) {
+            *outFrame = frame_;
+            return true;
+        }
+        if (ret == AVERROR_EOF) {
+            drained = true;
+            return false;
+        }
+        if (ret != AVERROR(EAGAIN) && isVideo) {
+            // A genuine decode error for one packet (h264_wiiu reports
+            // hardware decoder failures this way); the packet is already
+            // consumed, so log it and keep feeding.
+            video_decode_errors_++;
+            if (video_decode_errors_ <= 5 || video_decode_errors_ % 100 == 0) {
+                OSReport("Ufin: video decode error %d (count=%d)\n", ret, video_decode_errors_);
             }
         }
 
-        if (reachedEof_) {
-            // We've already sent the flush packets (nullptr) to both
-            // codecs; once receive_frame stops producing anything after
-            // that, there's genuinely nothing left.
+        if (!queue.empty()) {
+            AVPacket* pkt = queue.front();
+            int sendRet = avcodec_send_packet(ctx, pkt);
+            if (sendRet == AVERROR(EAGAIN)) {
+                // Wants output drained first, but just said it has none:
+                // try again on the next call rather than spin.
+                return false;
+            }
+            // Accepted -- or rejected outright, in which case the packet
+            // is unusable and dropping it is the only option.
+            queued_packet_bytes_ -= (size_t)pkt->size;
+            av_packet_free(&pkt);
+            queue.pop_front();
+            continue;
+        }
+        if (reachedEof_ && !flushed) {
+            avcodec_send_packet(ctx, nullptr); // flush: push out held frames
+            flushed = true;
+            continue;
+        }
+        if (flushed) {
+            // Flushed, nothing left to feed, and still no frame: treat as
+            // drained even if the decoder never says AVERROR_EOF, so the
+            // end of the stream is always reached.
+            drained = true;
+        }
+        return false; // needs more packets (or done)
+    }
+    return false;
+}
+
+DecodedFrameType Decoder::decodeVideoFrame(AVFrame** outFrame) {
+    return decodeFrom(video_ctx_, video_packets_, video_flushed_, video_drained_, true, outFrame)
+        ? DecodedFrameType::VIDEO : DecodedFrameType::NONE;
+}
+
+DecodedFrameType Decoder::decodeAudioFrame(AVFrame** outFrame) {
+    return decodeFrom(audio_ctx_, audio_packets_, audio_flushed_, audio_drained_, false, outFrame)
+        ? DecodedFrameType::AUDIO : DecodedFrameType::NONE;
+}
+
+bool Decoder::finished() const {
+    return reachedEof_ && (!video_ctx_ || video_drained_) && (!audio_ctx_ || audio_drained_);
+}
+
+DecodedFrameType Decoder::decodeNextFrame(AVFrame** outFrame) {
+    // Stream-order convenience wrapper over the per-stream calls: returns
+    // whatever frame is ready, reading packets as needed.
+    while (true) {
+        if (decodeVideoFrame(outFrame) == DecodedFrameType::VIDEO) return DecodedFrameType::VIDEO;
+        if (decodeAudioFrame(outFrame) == DecodedFrameType::AUDIO) return DecodedFrameType::AUDIO;
+        if (finished()) return DecodedFrameType::NONE;
+        if (!reachedEof_) {
+            readPacket();
+            continue;
+        }
+        // At end of stream with nothing left to feed: both decoders have
+        // been flushed by now, so if neither produced a frame we're done
+        // (guards against a decoder that never reports EOF after flush).
+        if (video_packets_.empty() && audio_packets_.empty() &&
+            (!video_ctx_ || video_flushed_) && (!audio_ctx_ || audio_flushed_)) {
             return DecodedFrameType::NONE;
         }
-
-        if (!packet_pending_) {
-            int readRet = av_read_frame(fmt_ctx_, packet_);
-            if (readRet < 0) {
-                // End of stream (or a network error we can't distinguish
-                // from EOF here) -- flush both decoders so any frames
-                // they're internally holding onto get pushed out.
-                OSReport("Ufin: av_read_frame returned %d -- treating as end of stream\n", readRet);
-                reachedEof_ = true;
-                if (video_ctx_) avcodec_send_packet(video_ctx_, nullptr);
-                if (audio_ctx_) avcodec_send_packet(audio_ctx_, nullptr);
-                continue;
-            }
-            packet_pending_ = true;
-            send_retries_ = 0;
-        }
-
-        AVCodecContext* target = nullptr;
-        if (packet_->stream_index == video_stream_index_) {
-            target = video_ctx_;
-        } else if (packet_->stream_index == audio_stream_index_) {
-            target = audio_ctx_;
-        }
-
-        if (!target) {
-            // Packets from any other stream (e.g. a subtitle track we
-            // never opened a codec for) are just dropped here.
-            av_packet_unref(packet_);
-            packet_pending_ = false;
-            continue;
-        }
-
-        int sendRet = avcodec_send_packet(target, packet_);
-        if (sendRet == AVERROR(EAGAIN) && send_retries_++ < 3) {
-            // Decoder wants us to drain output before accepting more
-            // input. Keep this packet pending and loop back to
-            // receive_frame() -- dropping it here (as the earlier code
-            // did) would lose a frame.
-            continue;
-        }
-        // Accepted -- or rejected outright, in which case the packet is
-        // unusable and dropping it is the only option.
-        av_packet_unref(packet_);
-        packet_pending_ = false;
-        // Loop back around to try receive_frame() again now that we've
-        // fed in a new packet.
     }
 }
 
@@ -271,10 +305,14 @@ int Decoder::audioChannels() const {
 }
 
 void Decoder::close() {
-    if (packet_pending_) {
-        av_packet_unref(packet_);
-        packet_pending_ = false;
-    }
+    if (packet_) av_packet_unref(packet_);
+    for (AVPacket* p : video_packets_) av_packet_free(&p);
+    for (AVPacket* p : audio_packets_) av_packet_free(&p);
+    video_packets_.clear();
+    audio_packets_.clear();
+    queued_packet_bytes_ = 0;
+    video_drained_ = audio_drained_ = false;
+    video_flushed_ = audio_flushed_ = false;
     if (video_ctx_) avcodec_free_context(&video_ctx_);
     if (audio_ctx_) avcodec_free_context(&audio_ctx_);
     if (fmt_ctx_) {

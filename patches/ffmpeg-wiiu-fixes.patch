@@ -1,0 +1,69 @@
+diff --git a/configure-wiiu b/configure-wiiu
+index fe3db8b..60a848f 100755
+--- a/configure-wiiu
++++ b/configure-wiiu
+@@ -13,6 +13,7 @@ export CFLAGS="-fomit-frame-pointer -ffast-math -fno-math-errno -funsafe-math-op
+ --disable-shared \
+ --disable-runtime-cpudetect \
+ --disable-programs \
++--disable-network \
+ --disable-doc \
+ --disable-everything \
+ --enable-decoder=mpeg4,h264_wiiu,aac,ac3,mp3 \
+diff --git a/libavcodec/h264_wiiu.c b/libavcodec/h264_wiiu.c
+index bd41335..c29d903 100644
+--- a/libavcodec/h264_wiiu.c
++++ b/libavcodec/h264_wiiu.c
+@@ -25,6 +25,10 @@ static int h264_wiiu_decode_init(AVCodecContext *avctx)
+     memRequirement = 0x2200000 + 0x3ff + 0x480000;
+ 
+     decoder = malloc(memRequirement);
++    if (!decoder) {
++        av_log(avctx, AV_LOG_ERROR, "h264_wiiu: decoder alloc failed");
++        return AVERROR(ENOMEM);
++    }
+     res = H264DECInitParam(memRequirement, decoder);
+     if (res != 0)
+     {
+@@ -62,8 +66,20 @@ static int h264_wiiu_decode_init(AVCodecContext *avctx)
+ 
+     ctx->decoder = decoder;
+ 
+-    framebuf_size = (avctx->width * avctx->height * 3) >> 1;
++    // The hardware writes rows at a 256-byte pitch and a 16-row aligned
++    // height, so size the buffer for that (plus slack) rather than
++    // width*height -- otherwise any size that isn't 1280x720 overflows
++    // the heap.
++    {
++        int pitch_a = (avctx->width + 255) & ~255;
++        int height_a = (avctx->height + 15) & ~15;
++        framebuf_size = pitch_a * height_a * 3 / 2 + 0x10000;
++    }
+     framebuffer = memalign(1024, framebuf_size);
++    if (!framebuffer) {
++        av_log(avctx, AV_LOG_ERROR, "h264_wiiu: framebuffer alloc failed (%d bytes)", framebuf_size);
++        return AVERROR(ENOMEM);
++    }
+ 
+     ctx->framebuffer = framebuffer;
+     ctx->framebuffer_size = framebuf_size;
+@@ -94,8 +110,8 @@ static int h264_wiiu_decode_close(AVCodecContext *avctx)
+ static int h264_wiiu_decode_frame(AVCodecContext *avctx, void *data, int *got_frame, AVPacket *avpkt)
+ {
+     WIIUContext* ctx = avctx->priv_data;
+-    uint8_t* buf = avpkt->buf->data;
+-    int buf_size = avpkt->buf->size;
++    uint8_t* buf = avpkt->data;
++    int buf_size = avpkt->size;
+     void* decoder = ctx->decoder;
+     void* framebuffer = ctx->framebuffer;
+     uint8_t* pointers[2];
+@@ -144,7 +160,7 @@ static int h264_wiiu_decode_frame(AVCodecContext *avctx, void *data, int *got_fr
+     // Y
+     pointers[0] = (uint8_t*) framebuffer;
+     // U/V
+-    pointers[1] = ((uint8_t*) framebuffer) + (avctx->height * pitch);
++    pointers[1] = ((uint8_t*) framebuffer) + (((avctx->height + 15) & ~15) * pitch);
+ 
+     av_image_copy(avframe->data, avframe->linesize, (const uint8_t **) pointers, linesize, AV_PIX_FMT_NV12, avctx->width, avctx->height);
+ 

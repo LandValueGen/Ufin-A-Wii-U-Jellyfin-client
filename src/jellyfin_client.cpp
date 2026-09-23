@@ -115,6 +115,7 @@ static void parseItemsArray(cJSON* items, std::vector<JellyfinItem>& out) {
         ji.channelNumber = jsonString(item, "ChannelNumber");
         cJSON* program = cJSON_GetObjectItem(item, "CurrentProgram");
         if (cJSON_IsObject(program)) ji.currentProgram = jsonString(program, "Name");
+        ji.seriesName = jsonString(item, "SeriesName");
         out.push_back(ji);
     }
 }
@@ -165,6 +166,25 @@ bool JellyfinClient::getLiveTvChannels(std::vector<JellyfinItem>& out) {
     cJSON* json = cJSON_Parse(resp.body.c_str());
     if (!json) {
         last_error_ = "could not parse channels JSON";
+        return false;
+    }
+    parseItemsArray(cJSON_GetObjectItem(json, "Items"), out);
+    cJSON_Delete(json);
+    return true;
+}
+
+bool JellyfinClient::search(const std::string& term, std::vector<JellyfinItem>& out) {
+    std::string path = "/Users/" + user_id_ + "/Items?SearchTerm=" + urlEncode(term) +
+                       "&Recursive=true&Limit=100&EnableImages=false&EnableUserData=false"
+                       "&IncludeItemTypes=Movie,Series,Episode,MusicAlbum,MusicArtist,Audio,BoxSet,Video";
+    HttpResponse resp = http_get(host_, port_, path, authHeader());
+    if (!resp.success) {
+        last_error_ = "search failed (status " + std::to_string(resp.status_code) + ")";
+        return false;
+    }
+    cJSON* json = cJSON_Parse(resp.body.c_str());
+    if (!json) {
+        last_error_ = "could not parse search JSON";
         return false;
     }
     parseItemsArray(cJSON_GetObjectItem(json, "Items"), out);
@@ -313,7 +333,7 @@ bool JellyfinClient::closeLiveStream(const std::string& liveStreamId) {
     return resp.success;
 }
 
-StreamTarget JellyfinClient::buildAudioStreamUrl(const std::string& itemId) const {
+StreamTarget JellyfinClient::buildAudioStreamUrl(const std::string& itemId, int64_t startTimeTicks) const {
     StreamTarget target;
     target.host = host_;
     target.port = port_;
@@ -330,6 +350,7 @@ StreamTarget JellyfinClient::buildAudioStreamUrl(const std::string& itemId) cons
         "&ApiKey=%s",
         itemId.c_str(), token_.c_str());
     target.path = pathBuf;
+    if (startTimeTicks > 0) target.path += "&StartTimeTicks=" + std::to_string((long long)startTimeTicks);
     return target;
 }
 
@@ -403,15 +424,22 @@ StreamTarget JellyfinClient::buildVideoStreamUrl(const std::string& itemId,
     if (!options.mediaSourceId.empty()) target.path += "&MediaSourceId=" + urlEncode(options.mediaSourceId);
     if (!options.liveStreamId.empty()) target.path += "&LiveStreamId=" + urlEncode(options.liveStreamId);
     if (!options.playSessionId.empty()) target.path += "&PlaySessionId=" + urlEncode(options.playSessionId);
+    if (options.startTimeTicks > 0) {
+        target.path += "&StartTimeTicks=" + std::to_string((long long)options.startTimeTicks);
+    }
     return target;
 }
 
 static bool postSessionEvent(const std::string& host, int port, const std::string& authHeader,
                               const std::string& endpoint, const std::string& itemId,
-                              int64_t positionTicks, bool includePosition, const PlaybackIds& ids) {
+                              int64_t positionTicks, bool includePosition, const PlaybackIds& ids,
+                              bool isPaused) {
     cJSON* body = cJSON_CreateObject();
     cJSON_AddStringToObject(body, "ItemId", itemId.c_str());
-    cJSON_AddBoolToObject(body, "CanSeek", false);
+    // Seeking = restarting the transcode at a new StartTimeTicks, which
+    // works for everything except Live TV.
+    cJSON_AddBoolToObject(body, "CanSeek", ids.liveStreamId.empty());
+    if (includePosition) cJSON_AddBoolToObject(body, "IsPaused", isPaused);
     cJSON_AddStringToObject(body, "PlayMethod", "Transcode");
     if (!ids.mediaSourceId.empty()) cJSON_AddStringToObject(body, "MediaSourceId", ids.mediaSourceId.c_str());
     if (!ids.liveStreamId.empty()) cJSON_AddStringToObject(body, "LiveStreamId", ids.liveStreamId.c_str());
@@ -429,17 +457,17 @@ static bool postSessionEvent(const std::string& host, int port, const std::strin
 }
 
 bool JellyfinClient::reportPlaybackStart(const std::string& itemId, const PlaybackIds& ids) {
-    return postSessionEvent(host_, port_, authHeader(), "/Sessions/Playing", itemId, 0, false, ids);
+    return postSessionEvent(host_, port_, authHeader(), "/Sessions/Playing", itemId, 0, false, ids, false);
 }
 
 bool JellyfinClient::reportPlaybackProgress(const std::string& itemId, int64_t positionTicks,
-                                            const PlaybackIds& ids) {
+                                            const PlaybackIds& ids, bool isPaused) {
     return postSessionEvent(host_, port_, authHeader(), "/Sessions/Playing/Progress", itemId,
-                             positionTicks, true, ids);
+                             positionTicks, true, ids, isPaused);
 }
 
 bool JellyfinClient::reportPlaybackStopped(const std::string& itemId, int64_t positionTicks,
                                            const PlaybackIds& ids) {
     return postSessionEvent(host_, port_, authHeader(), "/Sessions/Playing/Stopped", itemId,
-                             positionTicks, true, ids);
+                             positionTicks, true, ids, false);
 }

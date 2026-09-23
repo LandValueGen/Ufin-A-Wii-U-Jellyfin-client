@@ -37,6 +37,7 @@ add_executable(ufin
     src/media/player.cpp
     src/ui/screens.cpp
     src/ui/os_screen_display.cpp
+    src/ui/keyboard.cpp
 )
 
 target_include_directories(ufin PRIVATE src src/vendor)
