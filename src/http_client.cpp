@@ -1,6 +1,7 @@
 #include "http_client.h"
 
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -14,6 +15,21 @@
 // BSD sockets (it's meant to). If any of socket()/connect()/send()/recv()
 // don't link or behave, that's the first thing to flag back to me --
 // I haven't been able to compile-test this against the real toolchain.
+
+// Waits up to timeoutSeconds for the socket to become readable. wut has
+// no SO_RCVTIMEO, so this is how a server that accepts the connection
+// but never answers turns into an error instead of a frozen app.
+static bool wait_readable(int sock, int timeoutSeconds) {
+    fd_set readSet;
+    FD_ZERO(&readSet);
+    FD_SET(sock, &readSet);
+    struct timeval tv;
+    tv.tv_sec = timeoutSeconds;
+    tv.tv_usec = 0;
+    return select(sock + 1, &readSet, nullptr, nullptr, &tv) > 0;
+}
+
+static const int REQUEST_TIMEOUT_SECONDS = 20;
 
 static bool resolve_host(const std::string& host, struct in_addr* out) {
     if (inet_pton(AF_INET, host.c_str(), out) == 1) {
@@ -103,10 +119,23 @@ static HttpResponse do_request(const std::string& host, int port, const std::str
     std::string raw;
     char buf[2048];
     ssize_t n;
-    while ((n = recv(sock, buf, sizeof(buf), 0)) > 0) {
+    bool timedOut = false;
+    while (true) {
+        if (!wait_readable(sock, REQUEST_TIMEOUT_SECONDS)) {
+            timedOut = true;
+            break;
+        }
+        n = recv(sock, buf, sizeof(buf), 0);
+        if (n <= 0) break;
         raw.append(buf, (size_t)n);
     }
     close(sock);
+
+    if (timedOut && raw.empty()) {
+        resp.body = "timed out waiting for the server (" +
+                    std::to_string(REQUEST_TIMEOUT_SECONDS) + "s)";
+        return resp;
+    }
 
     if (raw.empty()) {
         resp.body = "empty response from server";

@@ -24,20 +24,25 @@ link_directories("$ENV{DEVKITPRO}/portlibs/wiiu/lib")
 
 add_executable(ufin
     src/main.cpp
+    src/config_loader.cpp
     src/http_client.cpp
     src/http_stream_reader.cpp
     src/jellyfin_client.cpp
+    src/item_labels.cpp
     src/vendor/cJSON.c
     src/media/http_stream_io.cpp
     src/media/decoder.cpp
     src/media/video_output.cpp
     src/media/audio_output.cpp
     src/media/player.cpp
+    src/ui/screens.cpp
+    src/ui/os_screen_display.cpp
+    src/ui/keyboard.cpp
 )
 
 target_include_directories(ufin PRIVATE src src/vendor)
 
-# Compile our GLSL shaders (src/media/shaders/rgb_video.{vert,frag}) into
+# Compile our GLSL shaders (src/media/shaders/nv12_video.{vert,frag}) into
 # a .gsh binary via glslcompiler.elf (from Exzap/CafeGLSL -- a Mesa-based
 # GLSL-to-Latte/GX2 shader compiler, MIT-licensed for its own additions),
 # then embed that binary into a C header via tools/bin2h.py so it ships
@@ -52,14 +57,14 @@ set(GLSLCOMPILER ${CMAKE_CURRENT_SOURCE_DIR}/tools/glslcompiler.elf)
 set(BIN2H ${CMAKE_CURRENT_SOURCE_DIR}/tools/bin2h.py)
 
 add_custom_command(
-    OUTPUT ${SHADER_DIR}/rgb_video_shader.h
-    COMMAND ${GLSLCOMPILER} -vs ${SHADER_DIR}/rgb_video.vert -ps ${SHADER_DIR}/rgb_video.frag
-            -o ${SHADER_DIR}/rgb_video.gsh
-    COMMAND python3 ${BIN2H} ${SHADER_DIR}/rgb_video.gsh ${SHADER_DIR}/rgb_video_shader.h rgb_video_shader
-    DEPENDS ${SHADER_DIR}/rgb_video.vert ${SHADER_DIR}/rgb_video.frag ${GLSLCOMPILER} ${BIN2H}
-    COMMENT "Compiling rgb_video shader (glslcompiler.elf + bin2h.py)"
+    OUTPUT ${SHADER_DIR}/nv12_video_shader.h
+    COMMAND ${GLSLCOMPILER} -vs ${SHADER_DIR}/nv12_video.vert -ps ${SHADER_DIR}/nv12_video.frag
+            -o ${SHADER_DIR}/nv12_video.gsh
+    COMMAND python3 ${BIN2H} ${SHADER_DIR}/nv12_video.gsh ${SHADER_DIR}/nv12_video_shader.h nv12_video_shader
+    DEPENDS ${SHADER_DIR}/nv12_video.vert ${SHADER_DIR}/nv12_video.frag ${GLSLCOMPILER} ${BIN2H}
+    COMMENT "Compiling nv12_video shader (glslcompiler.elf + bin2h.py)"
 )
-add_custom_target(ufin_shaders DEPENDS ${SHADER_DIR}/rgb_video_shader.h)
+add_custom_target(ufin_shaders DEPENDS ${SHADER_DIR}/nv12_video_shader.h)
 add_dependencies(ufin ufin_shaders)
 
 # whb = "Wii U Homebrew Bootstrap" helper lib bundled with wut, gives us
@@ -70,7 +75,9 @@ add_dependencies(ufin ufin_shaders)
 # FFmpeg libs: order matters for static linking -- avformat depends on
 # avcodec, both depend on avutil, swresample/swscale depend on avutil.
 # Listing avutil last lets the linker resolve symbols pulled in by the
-# others above it.
+# others above it. swscale is still linked because the h264_wiiu decoder
+# inside libavcodec references it, even though Ufin itself no longer
+# converts pixels on the CPU (the NV12 shader does that on the GPU).
 target_link_libraries(ufin
     wut
     SDL2

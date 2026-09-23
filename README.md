@@ -3,7 +3,7 @@ WIP jellyfin client for the Nintendo Wii U
 
 -------------------------------------------
 
-> ⚠️ Video playback is currently not functional. Music playback is the only working media playback feature at the moment.
+> ⚠️ Music playback is confirmed working on hardware. Video playback has a complete new pipeline (Wii U hardware H.264 decode via h264_wiiu, GPU NV12 rendering with raw GX2, audio-clock A/V sync) that has **not yet been verified on a real Wii U** -- please report what you see.
 
 # Jellyfin Wii U
 
@@ -18,9 +18,11 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 - ✅ Library browsing
 - ✅ Playback report to Jellyfin
 - ✅ Music playback
-- ❌ Full music player controls (Pause, shuffle, play queue and seek are yet to be added)
+- 🧪 Video playback (720p30 H.264 baseline + AAC, transcoded by the server; plays in Cemu, awaiting hardware testing)
+- 🧪 Live TV (channel list with what's on now; tuned and transcoded by the server)
+- ✅ Jellyfin 10.8 through 12.x (uses the modern `Authorization` header and `ApiKey` query parameter)
+- ❌ Full player controls (Pause, shuffle, play queue and seek are yet to be added)
 - ❌ Wii U style UI
-- ❌ Video playback
 
 ## Goals
 
@@ -41,8 +43,28 @@ A native Jellyfin client for the Nintendo Wii U because why not XD.
 2. Extract the contents of the ZIP to the root of your Wii U's SD card.
 
 3. Open "config.json" and enter your Jellyfin server details and credentials.
+   Optional keys: `video_bitrate` (bits/s, default 2500000) and `video_profile`
+   (`baseline` is the default and the safe choice for the Wii U's hardware
+   decoder; `main`/`high` are there for experiments).
 
 4. Insert the SD card into your Wii U and launch Ufin through your preferred homebrew method.
+
+## Controls
+
+| Button | Action |
+|---|---|
+| D-pad / left stick up-down | Move (hold to scroll fast) |
+| L / R, D-pad left-right | Page up / down |
+| A | Open folder / play |
+| B | Back; stops playback |
+| X | Search (Wii U on-screen keyboard) |
+| Y | Refresh the current list |
+| ZR | GX2 test picture (diagnostic) |
+
+During playback: **A** pause / resume, **Left** back 10 s, **Right** forward 30 s
+(presses add up: Right three times = +90 s), **B** stop. Live TV only has B.
+Skipping restarts the server's transcode at the new position, so it takes a
+moment, like starting playback.
 
 ## SD Card Layout:
 
@@ -55,9 +77,77 @@ SD:/
 │           └── config.json
 ```     
 
+## How video works
+
+The Wii U has no public software H.264 decoder fast enough for 720p, so Ufin
+leans on two things:
+
+- **Server side:** Jellyfin is asked to transcode to exactly 1280x720 H.264
+  *baseline* + AAC in fragmented MP4. The exact size matters -- the
+  `h264_wiiu` decoder in FFmpeg-wiiu sizes its framebuffer as
+  width x height x 1.5 while the hardware writes with a 256-pixel pitch and
+  16-row height alignment, and 1280x720 is the size where those agree.
+  Non-16:9 content therefore arrives anamorphically squeezed and is
+  un-squeezed at draw time using the aspect ratio from the item's metadata.
+  Baseline profile means no B-frames, so the hardware decoder's
+  one-frame-per-call output comes out in display order.
+- **Console side:** frames are decoded by the Wii U's hardware decoder
+  (`h264.rpl`, through `h264_wiiu`), uploaded as two GX2 textures (Y and
+  interleaved UV) and converted to RGB by a small pixel shader
+  (`src/media/shaders/nv12_video.frag`). Video is paced against the audio
+  clock; late frames are dropped.
+
+Debugging aids: all `OSReport` lines are prefixed `Ufin:` (visible over a
+Cemu/serial log), and pressing **ZR** in the menu draws a magenta test picture
+through the exact same GX2 path with no decoding involved.
+
 ## Development
 
 Built with WUT/devkitPro and tested on real Wii U hardware.
+
+### Building
+
+1. Install devkitPro with `wiiu-dev` and `wiiu-sdl2`. On Debian/Ubuntu/Mint
+   the installer must be fetched with `wget -U "dkp-apt" https://apt.devkitpro.org/install-devkitpro-pacman`
+   (the site's firewall blocks plain wget).
+2. Build [FFmpeg-wiiu](https://github.com/GaryOderNichts/FFmpeg-wiiu) **with
+   `patches/ffmpeg-wiiu-fixes.patch` applied** (`git apply` in the FFmpeg-wiiu
+   checkout). It fixes a heap overflow in `h264_wiiu` (framebuffer sized as
+   width*height*1.5 although the hardware writes a 256-pixel pitch and a
+   16-row aligned height), reads the packet from `avpkt->data` instead of
+   `avpkt->buf`, checks its allocations, and adds `--disable-network`
+   (current wut ships its own `inet_aton`, which clashes with FFmpeg's).
+   Then, with `DEVKITPRO`, `DEVKITPPC` and `WUT_ROOT=$DEVKITPRO/wut` set:
+   `./configure-wiiu && make -j$(nproc) && sudo -E make install`.
+3. Put `glslcompiler.elf` from [CafeGLSL](https://github.com/Exzap/CafeGLSL/releases)
+   in `tools/`, then `mkdir build && cd build && cmake .. && make`.
+
+### Testing in Cemu
+
+Cemu maps `sd:/` to its `sdcard` folder (`~/.local/share/Cemu/sdcard` for the
+Linux AppImage), so put `config.json` in `sdcard/wiiu/apps/ufin/`. Set up an
+emulated **Wii U GamePad** in Options -> Input settings. `127.0.0.1` works as
+the host when Jellyfin runs on the same PC (on a real Wii U it must be the
+PC's LAN address). The log with all `Ufin:` lines is Cemu's `log.txt`; on
+start-up it reports the measured text grid of both screens.
+
+Cemu draws OSScreen text on a different grid than the menus were first laid
+out for (16x24 glyphs from the screen edge), which made long lines wrap back
+over themselves and the selection band sit a row off. The UI now measures
+the grid at start-up instead of assuming it, so both look right.
+
+Everything that doesn't touch the Wii U hardware also has host-side tests
+(plain `g++`, no devkitPro needed): the menu screens, the Jellyfin client and
+HTTP layer, the config loader, the frame queue, the audio clock, and the real
+decoder/HTTP-stream chain pulling a fragmented MP4 over HTTP.
+
+```
+tests/host/run_tests.sh                      # UI, Jellyfin client, config
+FFMPEG_HOST=/path/to/ffmpeg tests/host/run_tests.sh   # + FFmpeg-based tests
+```
+
+See the header of `tests/host/run_tests.sh` for how to build the FFmpeg
+prefix it wants.
 
 This project is developed with really heavy AI assistance (Claude, Gemini and ChatGPT Free tiers). Architecture, design, testing and development decisions are human, tho the majority of the code is generated by AI, I am not a programmer yet, and this was my way to make something no one else has yet
 
